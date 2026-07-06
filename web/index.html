@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Drift Containment Twin</title>
+<style>
+  :root{
+    --bg:#0b0f17; --panel:#121826; --panel2:#0e1420; --line:#222c3f;
+    --ink:#e6ecf7; --dim:#8a97ad; --dim2:#5f6c82;
+    --ok:#2fbf71; --watch:#e6a23c; --flag:#ef4d5a; --contained:#3b82f6;
+    --accent:#7c9cff; --accent2:#a78bfa;
+    --shadow:0 6px 24px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,#16203a 0%,var(--bg) 55%);
+    color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
+  a{color:var(--accent)}
+  header{display:flex;align-items:center;gap:18px;padding:16px 24px;border-bottom:1px solid var(--line);
+    position:sticky;top:0;background:rgba(11,15,23,.85);backdrop-filter:blur(8px);z-index:10}
+  header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
+  header .sub{color:var(--dim);font-size:12px;margin-top:2px}
+  .grow{flex:1}
+  .chips{display:flex;gap:10px;flex-wrap:wrap}
+  .chip{display:flex;flex-direction:column;padding:6px 12px;border:1px solid var(--line);
+    border-radius:10px;background:var(--panel);min-width:96px}
+  .chip .k{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim2)}
+  .chip .v{font-size:16px;font-weight:650;font-variant-numeric:tabular-nums}
+  button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);
+    border-radius:8px;padding:7px 13px;cursor:pointer;transition:.15s}
+  button:hover{border-color:var(--accent);background:#18213a}
+  button.primary{background:linear-gradient(180deg,#3556c9,#2a44a8);border-color:#3d5bd0}
+  button.primary:hover{filter:brightness(1.1)}
+  button.approve{border-color:#1f7a4d} button.approve:hover{background:#123723}
+  button.reject{border-color:#7a2a30} button.reject:hover{background:#361417}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  main{display:grid;grid-template-columns:1.35fr 1fr;gap:16px;padding:16px 24px;max-width:1600px;margin:0 auto}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow:hidden}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim);
+    margin:0;padding:14px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
+  .card .body{padding:14px 16px}
+  .full{grid-column:1 / -1}
+  svg{width:100%;height:auto;display:block}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;padding:10px 16px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .dot{width:10px;height:10px;border-radius:3px;display:inline-block}
+  .narr{white-space:pre-wrap;font-size:13.5px;line-height:1.65}
+  .narr b{color:var(--accent2)}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:13px}
+  .kv .k{color:var(--dim)}
+  .tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid var(--line);margin:2px 4px 2px 0}
+  .status-ok{color:var(--ok)} .status-watch{color:var(--watch)}
+  .status-flagged{color:var(--flag)} .status-contained{color:var(--contained)}
+  .bar{height:7px;border-radius:4px;background:#1b2334;overflow:hidden;margin-top:3px}
+  .bar>i{display:block;height:100%;border-radius:4px}
+  .action{border:1px solid var(--line);border-radius:10px;padding:11px 12px;margin-bottom:10px;background:var(--panel2)}
+  .action .row{display:flex;align-items:center;gap:8px;justify-content:space-between}
+  .action .kind{font-weight:650;text-transform:capitalize}
+  .action .why{color:var(--dim);font-size:12.5px;margin:6px 0 9px}
+  .pill{font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;padding:3px 8px;border-radius:999px;border:1px solid var(--line)}
+  .pill.proposed{color:var(--watch);border-color:#3d3320}
+  .pill.applied{color:var(--ok);border-color:#173a27}
+  .pill.rejected{color:var(--flag);border-color:#3a1a1e}
+  .pill.reverted{color:var(--dim)}
+  .tabs{display:flex;gap:4px;padding:10px 16px 0;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .tab{padding:8px 13px;border-radius:8px 8px 0 0;color:var(--dim);cursor:pointer;border:1px solid transparent;border-bottom:none}
+  .tab.active{color:var(--ink);background:var(--panel2);border-color:var(--line)}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim2);font-weight:600;text-transform:uppercase;font-size:10.5px;letter-spacing:.5px}
+  td.mono,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .muted{color:var(--dim)}
+  .whatif{margin-top:8px;border-top:1px dashed var(--line);padding-top:9px}
+  .cols2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .minibox{border:1px solid var(--line);border-radius:9px;padding:9px 11px;background:var(--panel2)}
+  .minibox .t{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
+  .minibox .n{font-size:22px;font-weight:700}
+  .hint{color:var(--dim2);font-size:12px}
+  .node-hit{cursor:pointer}
+  .flash{animation:flash 1.4s ease}
+  @keyframes flash{0%{background:#1c2a4a}100%{background:var(--panel2)}}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Agent Drift Containment &amp; Remediation Twin</h1>
+    <div class="sub">Persistent causal digital twin · detect → attribute → remediate → redeploy</div>
+  </div>
+  <div class="grow"></div>
+  <div class="chips" id="chips"></div>
+  <button class="primary" onclick="reseed()">↻ Replay incident</button>
+</header>
+
+<main>
+  <!-- GRAPH -->
+  <section class="card" style="grid-row:span 2">
+    <h2>Digital Twin — Incident View <span class="muted" id="twinmeta"></span></h2>
+    <div id="graph"></div>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--ok)"></i>ok</span>
+      <span><i class="dot" style="background:var(--watch)"></i>watch</span>
+      <span><i class="dot" style="background:var(--flag)"></i>flagged</span>
+      <span><i class="dot" style="background:var(--contained)"></i>contained</span>
+      <span><i class="dot" style="background:var(--accent2)"></i>root cause</span>
+      <span style="color:var(--flag)">✕ blocked by inline rail</span>
+      <span class="muted">dashed = quarantined · click a node to inspect</span>
+    </div>
+  </section>
+
+  <!-- NARRATIVE -->
+  <section class="card">
+    <h2>Causal Narrative <span class="muted">(the moat: story, not an alert)</span></h2>
+    <div class="body"><div class="narr" id="narrative">Loading…</div></div>
+  </section>
+
+  <!-- REMEDIATION -->
+  <section class="card">
+    <h2>Remediation — human-approved &amp; reversible</h2>
+    <div class="body" id="remediation"></div>
+  </section>
+
+  <!-- TABS -->
+  <section class="card full">
+    <div class="tabs" id="tabs"></div>
+    <div class="body" id="tabbody"></div>
+  </section>
+</main>
+
+<script>
+const API = '';
+let STATE = {graph:null, narrative:null, actions:[], cost:null, audit:null, compliance:null,
+            selected:null, tab:'inspector', whatif:{}};
+
+const $ = s => document.querySelector(s);
+async function jget(u){const r=await fetch(API+u);if(!r.ok)throw new Error(u+' '+r.status);return r.json();}
+async function jpost(u){const r=await fetch(API+u,{method:'POST'});if(!r.ok)throw new Error(u+' '+r.status);return r.json();}
+
+const STATUS_COLOR={ok:'var(--ok)',watch:'var(--watch)',flagged:'var(--flag)',contained:'var(--contained)'};
+function fmtPct(x){return (x==null?'—':x.toFixed(2)+'%');}
+
+async function loadAll(){
+  const [graph,cost,audit,compliance,rem,persistence,guard] = await Promise.all([
+    jget('/api/graph'), jget('/api/cost'), jget('/api/audit'),
+    jget('/api/compliance'), jget('/api/remediation'),
+    jget('/api/persistence'), jget('/api/guard')]);
+  STATE.graph=graph; STATE.cost=cost; STATE.audit=audit;
+  STATE.compliance=compliance; STATE.actions=rem.actions;
+  STATE.persistence=persistence; STATE.guard=guard;
+  try{ STATE.narrative = await jget('/api/narrative'); }catch(e){ STATE.narrative=null; }
+  renderAll();
+}
+
+async function reseed(){ await jpost('/api/seed'); STATE.whatif={}; STATE.selected=null; await loadAll(); }
+
+function renderAll(){ renderChips(); renderGraph(); renderNarrative(); renderRemediation(); renderTabs(); }
+
+/* ---------- chips ---------- */
+function renderChips(){
+  const c=STATE.cost, comp=STATE.compliance, p=STATE.persistence||{}, g=STATE.guard||{};
+  const flagged=(STATE.graph.nodes||[]).filter(n=>n.drift.status==='flagged').length;
+  $('#chips').innerHTML = [
+    chip('Twin persistence', p.durable?('✓ durable · '+p.nodes_in_twin):'in-memory',
+         p.durable?'var(--ok)':'var(--watch)',
+         'Backed by a file DB. boot_mode='+(p.boot_mode||'?')+
+         ' — the graph, audit chain & cost snapshot survive a process restart.'),
+    chip('Compute overhead*', '~'+fmtPct(c.overhead_pct), c.overhead_pct<5?'var(--ok)':'var(--watch)',
+         'MODELLED from fixed per-tier token constants, not measured against a live model.'),
+    chip('Blocked pre-exec', g.blocked_count||0, (g.blocked_count?'var(--flag)':'var(--ink)'),
+         'Dangerous actions stopped synchronously by the inline deterministic rail before execution.'),
+    chip('Flagged (incident)', flagged, flagged?'var(--flag)':'var(--ok)'),
+    chip('Audit chain', comp.chain_valid?'✓ valid':'✗ broken', comp.chain_valid?'var(--ok)':'var(--flag)'),
+  ].join('');
+}
+function chip(k,v,color,title){return `<div class="chip"${title?` title="${esc(title)}"`:''}><span class="k">${k}</span><span class="v" style="color:${color}">${v}</span></div>`;}
+
+/* ---------- graph (custom layered SVG DAG) ---------- */
+function layout(nodes,edges){
+  const byId={}; nodes.forEach(n=>byId[n.node_id]=n);
+  const preds={}, succ={}; nodes.forEach(n=>{preds[n.node_id]=[];succ[n.node_id]=[];});
+  edges.forEach(e=>{ if(succ[e.src]){succ[e.src].push(e.dst); preds[e.dst].push(e.src);} });
+  // longest-path layering
+  const level={}; const order=topo(nodes,edges);
+  order.forEach(id=>{ level[id]=0; preds[id].forEach(p=>{ level[id]=Math.max(level[id],(level[p]||0)+1);});});
+  const byLevel={}; nodes.forEach(n=>{(byLevel[level[n.node_id]] ||= []).push(n.node_id);});
+  return {level,byLevel};
+}
+function topo(nodes,edges){
+  const indeg={},adj={}; nodes.forEach(n=>{indeg[n.node_id]=0;adj[n.node_id]=[];});
+  edges.forEach(e=>{ if(adj[e.src]){adj[e.src].push(e.dst); indeg[e.dst]++;} });
+  const q=nodes.map(n=>n.node_id).filter(id=>indeg[id]===0); const out=[];
+  while(q.length){const id=q.shift();out.push(id);(adj[id]||[]).forEach(d=>{if(--indeg[d]===0)q.push(d);});}
+  nodes.forEach(n=>{if(!out.includes(n.node_id))out.push(n.node_id);});
+  return out;
+}
+function renderGraph(){
+  const {nodes,edges,total_nodes_in_twin}=STATE.graph;
+  $('#twinmeta').textContent = `· ${nodes.length} of ${total_nodes_in_twin} runs in twin`;
+  const {level,byLevel}=layout(nodes,edges);
+  const COLW=180, ROWH=92, PADX=40, PADY=36, NW=140, NH=58;
+  const maxLevel=Math.max(...Object.keys(byLevel).map(Number),0);
+  const maxRows=Math.max(...Object.values(byLevel).map(a=>a.length),1);
+  const W=PADX*2+(maxLevel)*COLW+NW, H=PADY*2+(maxRows-1)*ROWH+NH;
+  const pos={};
+  Object.entries(byLevel).forEach(([lv,ids])=>{
+    ids.forEach((id,i)=>{
+      const colCount=ids.length;
+      const yOff=(maxRows-colCount)*ROWH/2;
+      pos[id]={x:PADX+lv*COLW, y:PADY+yOff+i*ROWH};
+    });
+  });
+  const nar=STATE.narrative;
+  const pathSet=new Set(nar?nar.propagation_path:[]);
+  const blastSet=new Set(nar?nar.blast_radius:[]);
+  const rootId=nar?nar.root_cause_node:null;
+
+  let svg=`<svg viewBox="0 0 ${W} ${H}" role="img">`;
+  svg+=`<defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#48577a"/></marker>
+    <marker id="arrowhot" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#ef4d5a"/></marker></defs>`;
+  // edges
+  edges.forEach(e=>{
+    const a=pos[e.src],b=pos[e.dst]; if(!a||!b)return;
+    const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2;
+    const mx=(x1+x2)/2;
+    const hot = pathSet.has(e.src)&&pathSet.has(e.dst);
+    const filtered = e.weight===0;
+    svg+=`<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2-9},${y2}" fill="none"
+      stroke="${filtered?'#2f3a52':(hot?'#ef4d5a':'#3a4660')}" stroke-width="${hot?2.4:1.5}"
+      ${filtered?'stroke-dasharray="3 4"':''} marker-end="url(#${hot?'arrowhot':'arrow'})" opacity="${filtered?.5:.95}"/>`;
+    if(filtered){ svg+=`<text x="${mx}" y="${(y1+y2)/2-6}" fill="#2f3a52" font-size="10" text-anchor="middle">filtered</text>`;}
+  });
+  // nodes
+  nodes.forEach(n=>{
+    const p=pos[n.node_id]; const st=n.drift.status; const col=STATUS_COLOR[st]||'var(--dim)';
+    const isRoot=n.node_id===rootId; const inBlast=blastSet.has(n.node_id);
+    const sel=STATE.selected===n.node_id;
+    const stroke=isRoot?'#a78bfa':(sel?'#7c9cff':col);
+    svg+=`<g class="node-hit" onclick="selectNode('${n.node_id}')" transform="translate(${p.x},${p.y})">`;
+    svg+=`<rect width="${NW}" height="${NH}" rx="11" fill="#111a2b" stroke="${stroke}"
+      stroke-width="${isRoot||sel?2.6:1.4}" ${n.quarantined?'stroke-dasharray="5 4"':''}/>`;
+    svg+=`<rect width="5" height="${NH}" rx="2" fill="${col}"/>`;
+    svg+=`<text x="14" y="22" fill="#e6ecf7" font-size="12.5" font-weight="600">${esc(n.agent_id)}</text>`;
+    svg+=`<text x="14" y="38" fill="#8a97ad" font-size="10.5">${esc(n.agent_role)}</text>`;
+    svg+=`<text x="14" y="51" fill="${col}" font-size="10.5">${st}${n.drift.score?(' · '+n.drift.score.toFixed(2)):''}</text>`;
+    if(n.privilege==='high') svg+=`<circle cx="${NW-12}" cy="12" r="4.5" fill="#e6a23c"><title>high privilege — full coverage</title></circle>`;
+    if(n.blocked) svg+=`<text x="14" y="${NH-8}" fill="#ef4d5a" font-size="9.5" font-weight="600">✕ blocked pre-exec<title>${esc(n.blocked_reason||'')}</title></text>`;
+    if(isRoot) svg+=`<text x="${NW-10}" y="${NH-8}" fill="#a78bfa" font-size="9.5" text-anchor="end">root cause</text>`;
+    else if(inBlast) svg+=`<text x="${NW-10}" y="${NH-8}" fill="#8a97ad" font-size="9.5" text-anchor="end">blast</text>`;
+    svg+=`</g>`;
+  });
+  svg+=`</svg>`;
+  $('#graph').innerHTML=svg;
+}
+
+/* ---------- narrative ---------- */
+function renderNarrative(){
+  const n=STATE.narrative;
+  if(!n){ $('#narrative').textContent='No active incident. Traffic is clean.'; return; }
+  const html = esc(n.narrative)
+    .replace('Root cause:','<b>Root cause:</b>')
+    .replace('Propagation path:','<b>Propagation path:</b>')
+    .replace('Blast radius:','<b>Blast radius:</b>')
+    .replace('Recommended remediation:','<b>Recommended remediation:</b>');
+  $('#narrative').innerHTML = html;
+}
+
+/* ---------- remediation ---------- */
+function renderRemediation(){
+  const acts=STATE.actions;
+  if(!acts.length){ $('#remediation').innerHTML='<div class="hint">No proposed remediation.</div>'; return; }
+  $('#remediation').innerHTML = acts.map(a=>{
+    const st=a.status;
+    const canAct = st==='proposed';
+    const canRevert = st==='applied';
+    const wi = STATE.whatif[a.action_id];
+    return `<div class="action">
+      <div class="row">
+        <span class="kind">${a.kind.replace('_',' ')} · <span class="mono muted">${esc(a.node_id)}</span></span>
+        <span class="pill ${st}">${st}</span>
+      </div>
+      <div class="why">${esc(a.rationale)}</div>
+      <div class="row" style="justify-content:flex-start">
+        ${canAct?`<button class="approve" onclick="approve('${a.action_id}')">Approve &amp; apply</button>
+                  <button class="reject" onclick="reject('${a.action_id}')">Reject</button>`:''}
+        ${canRevert?`<button onclick="revert('${a.action_id}')">Revert</button>`:''}
+        <button onclick="previewWhatif('${a.action_id}','${a.node_id}')">What-if preview</button>
+      </div>
+      ${wi?renderWhatif(wi):''}
+    </div>`;
+  }).join('');
+}
+function renderWhatif(wi){
+  const before=wi.do_nothing_blast_radius.length;
+  const saved=wi.contained_nodes.length;
+  const still=wi.remediated_blast_radius.length;
+  return `<div class="whatif">
+    <div class="hint" style="margin-bottom:7px">Counterfactual preview (advisory — a <b>real forward replay</b> over the twin: corrected context substituted at the root, detection re-run node-by-node; no agents re-executed, no new inference):</div>
+    <div class="cols2">
+      <div class="minibox"><div class="t">Do nothing</div><div class="n" style="color:var(--flag)">${before}</div><div class="hint">nodes stay drifted</div></div>
+      <div class="minibox"><div class="t">After this fix</div><div class="n" style="color:var(--ok)">${saved} saved</div><div class="hint">${still} keep own fault</div></div>
+    </div>
+    <div class="hint" style="margin-top:7px">${esc(wi.summary)}</div>
+  </div>`;
+}
+
+async function approve(id){ await jpost('/api/remediation/'+id+'/approve'); await loadAll(); flashGraph(); }
+async function reject(id){ await jpost('/api/remediation/'+id+'/reject'); await loadAll(); }
+async function revert(id){ await jpost('/api/remediation/'+id+'/revert'); await loadAll(); }
+async function previewWhatif(aid,nid){ STATE.whatif[aid]=await jget('/api/whatif/'+nid); renderRemediation(); }
+function flashGraph(){ const g=$('#graph'); g.classList.remove('flash'); void g.offsetWidth; g.classList.add('flash'); }
+
+/* ---------- node select ---------- */
+async function selectNode(id){ STATE.selected=id; STATE.tab='inspector'; STATE.nodeDetail=await jget('/api/node/'+id); renderGraph(); renderTabs(); }
+
+/* ---------- tabs ---------- */
+const TABS=[['inspector','Node Inspector'],['cost','Cost Router'],['audit','Audit Trail'],['compliance','Compliance']];
+function renderTabs(){
+  $('#tabs').innerHTML=TABS.map(([k,l])=>`<div class="tab ${STATE.tab===k?'active':''}" onclick="setTab('${k}')">${l}</div>`).join('');
+  const body=$('#tabbody');
+  if(STATE.tab==='inspector') body.innerHTML=renderInspector();
+  else if(STATE.tab==='cost') body.innerHTML=renderCost();
+  else if(STATE.tab==='audit') body.innerHTML=renderAudit();
+  else if(STATE.tab==='compliance') body.innerHTML=renderCompliance();
+}
+function setTab(k){STATE.tab=k;renderTabs();}
+
+function renderInspector(){
+  const n=STATE.nodeDetail;
+  if(!n) return '<div class="hint">Click a node in the twin to inspect its drift signals, declared intent, and observed behaviour.</div>';
+  const d=n.drift;
+  const flags=(d.deterministic||[]).map(f=>`<span class="tag" style="border-color:#3a2a1a;color:var(--watch)">${esc(f.rule)} · ${f.severity.toFixed(2)}</span> <span class="muted">${esc(f.detail)}</span>`).join('<br>')||'<span class="muted">none</span>';
+  const tools=(n.tool_calls||[]).map(t=>{const a=Object.entries(t.args||{}).map(([k,v])=>k+'='+v).join(', ');return esc(t.name+'('+a+')');}).join(', ')||'—';
+  const judge=d.judge?`serves_goal=<b class="${d.judge.serves_goal?'status-ok':'status-flagged'}">${d.judge.serves_goal}</b> (conf ${d.judge.confidence.toFixed(2)}) — ${esc(d.judge.rationale)}`:'<span class="muted">not escalated to judge</span>';
+  return `<div class="cols2">
+    <div>
+      <div class="kv">
+        <span class="k">Agent</span><span><b>${esc(n.agent_id)}</b> — ${esc(n.agent_role)}</span>
+        <span class="k">Privilege</span><span>${n.privilege}${n.privilege==='high'?' ⚠':''}</span>
+        <span class="k">Status</span><span class="status-${d.status}"><b>${d.status}</b> · score ${d.score.toFixed(2)}</span>
+        <span class="k">Risk type</span><span>${d.risk_type?esc(d.risk_type):'<span class=muted>—</span>'}</span>
+        <span class="k">Tier reached</span><span class="mono">${d.tier_reached}</span>
+        <span class="k">Inline rail</span><span>${n.blocked?'<b class=status-flagged>✕ action blocked pre-exec</b>':'—'}</span>
+        <span class="k">Quarantined</span><span>${n.quarantined?'<b class=status-contained>yes</b>':'no'}</span>
+      </div>
+      ${bar('Stated-vs-revealed gap — structural (PRIMARY)',d.stated_vs_revealed,'var(--flag)')}
+      ${bar('Trajectory drift — lexical (illustrative)',d.trajectory_drift,'var(--watch)')}
+      <div class="hint" style="margin-top:7px">
+        Primary trigger: <b style="color:${d.svr_primary&&d.svr_primary!=='lexical'?'var(--flag)':'var(--dim)'}">${esc(d.svr_primary||'—')}</b>
+        ${d.svr_primary&&d.svr_primary!=='lexical'?'<span class="muted">(structural, keyword-free)</span>':'<span class="muted">(no structural divergence)</span>'}
+        ${d.injection_introduced?'<br>⚠ <b style="color:var(--flag)">origin</b> of a task-foreign entity — structural injection, not a planted phrase':''}
+        ${(d.foreign_entities&&d.foreign_entities.length)?('<br>Foreign entities: <span class="mono">'+d.foreign_entities.map(esc).join(', ')+'</span>'):''}
+        <br><span class="muted">Embedding distances come from the offline lexical stub — illustrative, never the sole trigger.</span>
+      </div>
+    </div>
+    <div>
+      <div class="k muted" style="margin-bottom:3px">Declared intent (what it says)</div>
+      <div class="minibox" style="margin-bottom:9px">${esc(n.declared_intent)||'—'}</div>
+      <div class="k muted" style="margin-bottom:3px">Observed behaviour (what it does)</div>
+      <div class="minibox"><div class="muted mono" style="font-size:11px">tools:</div>${esc(tools)}
+        ${(n.effects||[]).length?'<div class="muted mono" style="font-size:11px;margin-top:5px">effects:</div>'+esc(n.effects.join('; ')):''}
+        <div class="muted mono" style="font-size:11px;margin-top:5px">output:</div>${esc(n.output)||'—'}</div>
+    </div>
+  </div>
+  <div style="margin-top:12px">
+    <div class="k muted" style="margin-bottom:4px">Deterministic checks (zero-token)</div>${flags}
+    <div class="k muted" style="margin:10px 0 4px">Small-model judge (escalation only)</div>${judge}
+  </div>`;
+}
+function bar(label,v,col){
+  return `<div style="margin-top:9px"><div style="display:flex;justify-content:space-between"><span class="muted">${label}</span><span class="mono">${(v||0).toFixed(2)}</span></div>
+    <div class="bar"><i style="width:${Math.round((v||0)*100)}%;background:${col}"></i></div></div>`;
+}
+
+function renderCost(){
+  const c=STATE.cost; const t=c.tier_counts;
+  return `<div class="cols2" style="margin-bottom:14px">
+    <div class="minibox"><div class="t">Compute overhead <span style="color:var(--dim2)">(modelled*)</span></div><div class="n" style="color:${c.overhead_pct<5?'var(--ok)':'var(--watch)'}">~${fmtPct(c.overhead_pct)}</div><div class="hint">added ÷ baseline — *token figures modelled from fixed per-tier constants, not measured against a live model</div></div>
+    <div class="minibox"><div class="t">Dedup cache hits</div><div class="n">${c.cache_hits}</div><div class="hint">repeated reasoning never re-analysed</div></div>
+  </div>
+  <table><thead><tr><th>Tier</th><th>Spans routed</th><th>Note</th></tr></thead><tbody>
+    <tr><td class="mono">zero_inference</td><td>${t.zero_inference}</td><td class="muted">CPU-only: embeddings, diffing, validators</td></tr>
+    <tr><td class="mono">sampled</td><td>${t.sampled}</td><td class="muted">risk-weighted thinning of low-stakes agents</td></tr>
+    <tr><td class="mono">small_judge</td><td>${t.small_judge}</td><td class="muted">narrow classifier, only after a cheap flag</td></tr>
+    <tr><td class="mono">deep_escalation</td><td>${t.deep_escalation}</td><td class="muted">full-context deep analysis — only on flagged</td></tr>
+  </tbody></table>
+  <div class="hint" style="margin-top:10px">${c.spans_seen} spans observed · ${c.spans_sampled} sampled · baseline ${c.baseline_tokens.toLocaleString()} tok · added ${c.added_tokens.toLocaleString()} tok. The escalation trigger is deterministic and computed by the platform — it is never exposed to the monitored agents, so they cannot suppress it.</div>`;
+}
+
+function renderAudit(){
+  const rows=(STATE.audit.entries||[]).slice().reverse().map(e=>`<tr>
+    <td class="mono">${esc((e.action||''))}</td>
+    <td>${esc(e.actor)}</td>
+    <td class="mono">${esc(e.target)}</td>
+    <td>${esc(e.detail)}</td>
+    <td>${(e.compliance_tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('')||'<span class=muted>—</span>'}</td>
+  </tr>`).join('');
+  return `<div class="hint" style="margin-bottom:8px">Tamper-evident hash chain: <b class="${STATE.compliance.chain_valid?'status-ok':'status-flagged'}">${STATE.compliance.chain_valid?'✓ verified':'✗ broken'}</b> · ${STATE.audit.entries.length} entries. Every supervisor action is attributable, reversible, and logged.</div>
+  <table><thead><tr><th>Action</th><th>Actor</th><th>Target</th><th>Detail</th><th>Compliance mapping</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderCompliance(){
+  const c=STATE.compliance;
+  const rows=Object.entries(c.coverage_by_clause).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="mono">${v}</td></tr>`).join('');
+  return `<div class="hint" style="margin-bottom:8px">Same audit data, re-projected for GRC. Framework list is configurable (swappable annotation, not baked in). Report generated on demand.</div>
+  <table><thead><tr><th>Framework clause</th><th>Events logged</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+loadAll().catch(e=>{document.body.innerHTML='<pre style="padding:24px;color:#ef4d5a">'+e.stack+'</pre>';});
+</script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# Live integration stack (Phases 0-4) — reused components per builder brief §9.
+# Heavy (LlamaFirewall pulls torch/transformers). Install into the same environment
+# as requirements.txt. NOT needed for the offline demo or the test suite.
+#
+#   pip install -r requirements.txt -r requirements-integrations.txt
+#
+# TrinityGuard is installed from source (not on PyPI):
+#   git clone https://github.com/AI45Lab/TrinityGuard && pip install -e ./TrinityGuard
+
+# --- Substrate (Phase 1): telemetry store + OTel + eval API ---
+arize-phoenix>=7.0            # self-hosted trace store; our Span <-> OTel span boundary
+openinference-instrumentation # OTel semantic conventions for LLM/agent spans
+
+# --- Orchestration adapter (Phase 2): TrinityGuard's BaseMAS targets AG2/AutoGen ---
+ag2>=0.7                      # AutoGen (AG2) — TrinityGuard's reference MAS framework
+
+# --- Drift/alignment scanner (Phase 3) ---
+llamafirewall>=1.0           # AlignmentCheck scanner (stated-vs-revealed) + PromptGuard
+
+# --- Deterministic gates (Phase 4) ---
+nemoguardrails>=0.11         # rails engine for the inline hard-stop rail

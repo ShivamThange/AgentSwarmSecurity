@@ -1,0 +1,11 @@
+# Core runtime — enough to run the full offline demo + tests (no downloads, no key).
+fastapi>=0.110
+uvicorn>=0.27
+pydantic>=2.5
+numpy>=1.26
+networkx>=3.2
+
+# Optional: enables the online LLM judge tier (hybrid). Safe to install; the judge
+# only activates when LLM_API_KEY is set (see .env.example). Lazy-imported, so its
+# presence never affects the offline path.
+openai>=1.30
