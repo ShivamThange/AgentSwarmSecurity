@@ -1,16 +1,3 @@
-"""Persistent lineage graph / digital twin — CORE IP (Section 8.1).
-
-Node = an agent run. Edge = an influence relation ("output of run X entered the
-input/context of run Y"). Unlike the stateless per-run tools in Section 9, this
-graph is *durable across runs and sessions* (SQLite) and supports the two queries
-the brief names as the defensible capability:
-
-  * blast_radius(node)  -> every downstream node the node influenced
-  * upstream(node)      -> walk edges backward toward the originating fault
-
-NetworkX gives the traversals; SQLite gives the persistence. Checkpoints of agent
-context are stored here too, so rollback (Section 8.3) is a graph operation.
-"""
 from __future__ import annotations
 
 import json
@@ -22,7 +9,6 @@ import networkx as nx
 
 from .models import TwinEdge, TwinNode
 
-
 class TwinStore:
     def __init__(self, db_path: str = ":memory:") -> None:
         self.db_path = db_path
@@ -32,9 +18,6 @@ class TwinStore:
         self._init_schema()
         self._load_graph()
 
-    # ------------------------------------------------------------------ #
-    # schema / load
-    # ------------------------------------------------------------------ #
     def _init_schema(self) -> None:
         cur = self._conn.cursor()
         cur.executescript(
@@ -78,9 +61,6 @@ class TwinStore:
         for row in cur.execute("SELECT src, dst, kind, weight FROM edges"):
             self._g.add_edge(row["src"], row["dst"], kind=row["kind"], weight=row["weight"])
 
-    # ------------------------------------------------------------------ #
-    # writes
-    # ------------------------------------------------------------------ #
     def upsert_node(self, node: TwinNode) -> None:
         if node.timestamp is None:
             node.timestamp = time.time()
@@ -100,9 +80,6 @@ class TwinStore:
         self._conn.commit()
         self._g.add_edge(edge.src, edge.dst, kind=edge.kind, weight=edge.weight)
 
-    # ------------------------------------------------------------------ #
-    # reads
-    # ------------------------------------------------------------------ #
     def get_node(self, node_id: str) -> Optional[TwinNode]:
         data = self._g.nodes.get(node_id, {}).get("node")
         return data
@@ -120,19 +97,16 @@ class TwinStore:
         ]
 
     def blast_radius(self, node_id: str) -> list[str]:
-        """Every downstream node influenced by `node_id` (excluding itself)."""
         if node_id not in self._g:
             return []
         return list(nx.descendants(self._g, node_id))
 
     def upstream(self, node_id: str) -> list[str]:
-        """Every upstream node that influenced `node_id` (ancestors)."""
         if node_id not in self._g:
             return []
         return list(nx.ancestors(self._g, node_id))
 
     def propagation_path(self, root: str, target: str) -> list[str]:
-        """A concrete influence path root -> target, if one exists."""
         if root not in self._g or target not in self._g:
             return []
         try:
@@ -146,7 +120,7 @@ class TwinStore:
     def topo_order(self) -> list[str]:
         try:
             return list(nx.topological_sort(self._g))
-        except nx.NetworkXUnfeasible:  # cycle; fall back to insertion order
+        except nx.NetworkXUnfeasible:
             return list(self._g.nodes)
 
     def successors(self, node_id: str) -> list[str]:
@@ -155,9 +129,6 @@ class TwinStore:
     def predecessors(self, node_id: str) -> list[str]:
         return list(self._g.predecessors(node_id)) if node_id in self._g else []
 
-    # ------------------------------------------------------------------ #
-    # checkpoints (for rollback — Section 8.3)
-    # ------------------------------------------------------------------ #
     def save_checkpoint(self, checkpoint_id: str, node_id: str, agent_id: str,
                         context: dict, label: str = "") -> None:
         self._conn.execute(
@@ -181,9 +152,6 @@ class TwinStore:
         ).fetchone()
         return row["checkpoint_id"] if row else None
 
-    # ------------------------------------------------------------------ #
-    # meta key/value (durable side-state, e.g. the cost-ledger snapshot)
-    # ------------------------------------------------------------------ #
     def set_meta(self, key: str, value: dict) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)",
@@ -200,7 +168,7 @@ class TwinStore:
     def close(self) -> None:
         try:
             self._conn.close()
-        except Exception:  # pragma: no cover - best effort
+        except Exception:
             pass
 
     def reset(self) -> None:

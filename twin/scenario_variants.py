@@ -1,18 +1,7 @@
-"""Held-out injection variants (Section 5 — non-circularity check).
-
-The point of these is to prove the detector is NOT a mirror of the seed scenario.
-Each variant phrases the injection differently and, critically, contains NONE of
-the `StubJudge.INJECTION_MARKERS` keyword strings. If the retriever node still
-flags as a structural prompt-injection, detection is standing on the real signal
-(a foreign actionable entity introduced into the output) rather than on a planted
-phrase.
-"""
 from __future__ import annotations
 
 from .models import Privilege, Span, ToolCall
 
-# Each entry: (variant_id, injected_output, injected_effect)
-# None of these use "ignore previous", "system override", "disregard", etc.
 _VARIANTS = [
     (
         "v-polite-policy",
@@ -36,11 +25,8 @@ _VARIANTS = [
     ),
 ]
 
-
 def retriever_variant(injected_output: str, injected_effect: str,
                       variant_id: str) -> list[Span]:
-    """A minimal 2-span chain: a clean orchestrator hand-off into a retriever
-    whose output carries an injected, task-foreign directive."""
     trace = f"trace-{variant_id}"
     return [
         Span(
@@ -64,7 +50,6 @@ def retriever_variant(injected_output: str, injected_effect: str,
             inputs_from=[f"{variant_id}-A1"],
         ),
     ]
-
 
 def all_variants() -> list[tuple[str, list[Span]]]:
     return [(vid, retriever_variant(out, eff, vid)) for vid, out, eff in _VARIANTS]

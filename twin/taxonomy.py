@@ -1,36 +1,16 @@
-"""Adopted MAS risk taxonomy — TrinityGuard's OWASP-grounded 20-type, 3-tier set
-(Wang et al., 2026, arXiv:2603.15408; https://github.com/AI45Lab/TrinityGuard).
-
-Per the brief (§5 "Detection is a taxonomy, not a binary" and §9 "reuse TrinityGuard's
-multi-agent risk taxonomy"), we do NOT invent drift categories — we adopt this one and
-map our detector signals onto it. The three tiers mirror where a risk manifests:
-
-  RT1  atomic (per-agent)          — a single agent in isolation
-  RT2  communication (per-channel) — a hand-off between two agents
-  RT3  system (per-trajectory)     — emergent over the whole chain
-
-Our twin's distinctive contribution sits exactly on the seam TrinityGuard names as its
-own future work: causally linking an RT3 system-level failure (e.g. Cascading Failure)
-back to the RT1 atomic fault that started it (e.g. Prompt Injection), across the durable
-lineage graph. So a risk here also carries the tier, which the attribution layer uses to
-tell the "atomic cause -> system effect" story.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 @dataclass(frozen=True)
 class RiskType:
-    risk_id: str        # TrinityGuard id, e.g. "RT1.1"
-    key: str            # our internal snake_case key
-    name: str           # human name, e.g. "Prompt Injection"
-    owasp_ref: str      # OWASP LLM/Agentic reference
-    tier: int           # 1 atomic | 2 communication | 3 system
+    risk_id: str
+    key: str
+    name: str
+    owasp_ref: str
+    tier: int
     description: str
 
-
-# --- RT1: single-agent atomic risks (Table 1) ---
 RT1 = [
     RiskType("RT1.1", "prompt_injection", "Prompt Injection", "LLM01", 1,
              "Manipulating agent behavior via malicious input"),
@@ -50,7 +30,6 @@ RT1 = [
              "Improper use of external tools or APIs"),
 ]
 
-# --- RT2: inter-agent communication risks (Table 2) ---
 RT2 = [
     RiskType("RT2.1", "malicious_propagation", "Malicious Propagation", "ASI07", 2,
              "Malicious instructions spreading through the agent network"),
@@ -66,7 +45,6 @@ RT2 = [
              "Impersonation of a trusted agent"),
 ]
 
-# --- RT3: system-level emergent risks (Table 3) ---
 RT3 = [
     RiskType("RT3.1", "cascading_failure", "Cascading Failure", "ASI08", 3,
              "A single-point failure triggering system-wide collapse"),
@@ -86,20 +64,16 @@ ALL_RISKS = RT1 + RT2 + RT3
 BY_KEY = {r.key: r for r in ALL_RISKS}
 BY_ID = {r.risk_id: r for r in ALL_RISKS}
 
-# Back-compat aliases: earlier internal keys -> adopted taxonomy keys, so existing
-# risk_type strings keep resolving to a canonical TrinityGuard entry.
 _ALIASES = {
-    "goal_misgeneralization": "goal_drift",     # our old name for RT2.4
-    "context_rot": "insecure_output_handling",  # inherited-contamination -> RT2.3
-    "confidence_collapse": "hallucination",     # low-confidence generation -> RT1.6
+    "goal_misgeneralization": "goal_drift",
+    "context_rot": "insecure_output_handling",
+    "confidence_collapse": "hallucination",
 }
-
 
 def lookup(key: str | None) -> RiskType | None:
     if not key:
         return None
     return BY_KEY.get(key) or BY_KEY.get(_ALIASES.get(key, ""))
-
 
 def canonical_key(key: str | None) -> str | None:
     r = lookup(key)

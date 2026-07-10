@@ -1,13 +1,3 @@
-"""Closed-loop, human-approved remediation (Sections 8.3 / 8.4).
-
-Wraps the allow/replace/deny primitives into a supervisor loop over the twin.
-Every action is PROPOSED -> APPROVED (by a human, by default) -> APPLIED, is
-reversible, and is written to the audit trail. Remediation operates on *context*,
-never model internals (guardrail 4).
-
-Automated application is permitted ONLY for a predefined low-risk allow-list; a
-policy that ships empty (fully human-in-the-loop) by default.
-"""
 from __future__ import annotations
 
 import time
@@ -18,10 +8,7 @@ from .models import (
     ActionStatus, DriftStatus, RemediationAction, RemediationKind,
 )
 
-# Predefined low-risk strategies that MAY auto-apply (Section 8.3). Empty by
-# default => everything is human-approved. Populate to opt specific kinds in.
 AUTO_APPROVE_KINDS: set[RemediationKind] = set()
-
 
 class RemediationEngine:
     def __init__(self, store: TwinStore, audit: AuditLog) -> None:
@@ -29,7 +16,6 @@ class RemediationEngine:
         self.audit = audit
         self._actions: dict[str, RemediationAction] = {}
 
-    # ------------------------------------------------------------------ #
     def register(self, actions: list[RemediationAction]) -> None:
         for a in actions:
             a.timestamp = a.timestamp or time.time()
@@ -46,7 +32,6 @@ class RemediationEngine:
     def all_actions(self) -> list[RemediationAction]:
         return list(self._actions.values())
 
-    # ------------------------------------------------------------------ #
     def approve(self, action_id: str, approver: str = "supervisor") -> RemediationAction:
         a = self._actions[action_id]
         if a.status not in (ActionStatus.PROPOSED,):
@@ -71,7 +56,6 @@ class RemediationEngine:
             return self.approve(action_id, approver="auto-policy")
         return None
 
-    # ------------------------------------------------------------------ #
     def _apply(self, a: RemediationAction, actor: str) -> RemediationAction:
         node = self.store.get_node(a.node_id)
         if node is None:
@@ -99,12 +83,12 @@ class RemediationEngine:
         elif a.kind == RemediationKind.MESSAGE_FILTER:
             dst = a.params.get("edge_to")
             a.before_state = {"edge_to": dst, "filtered": False}
-            # neutralise the contaminated hand-off: drop edge weight to 0
+
             for e in self.store.all_edges():
                 if e.src == a.node_id and e.dst == dst:
                     e.weight = 0.0
                     self.store.add_edge(e)
-            # a downstream consumer no longer inherits the contamination
+
             child = self.store.get_node(dst)
             if child and child.drift.status in (DriftStatus.FLAGGED, DriftStatus.WATCH):
                 child.drift.status = DriftStatus.CONTAINED
@@ -136,7 +120,6 @@ class RemediationEngine:
                           reversible=a.reversible)
         return a
 
-    # ------------------------------------------------------------------ #
     def revert(self, action_id: str, actor: str = "supervisor") -> RemediationAction:
         a = self._actions[action_id]
         if a.status != ActionStatus.APPLIED:
@@ -153,7 +136,7 @@ class RemediationEngine:
                     if e.src == a.node_id and e.dst == dst:
                         e.weight = 1.0
                         self.store.add_edge(e)
-            else:  # rollback / context_edit / redeploy
+            else:
                 node.declared_intent = bs.get("declared_intent", node.declared_intent)
                 node.output = bs.get("output", node.output)
                 node.task = bs.get("task", node.task)
@@ -164,7 +147,6 @@ class RemediationEngine:
         self.audit.record(actor, "remediation.reverted", a.node_id,
                           detail=f"{a.kind.value} reverted to prior state")
         return a
-
 
 def _snapshot(node) -> dict:
     return {

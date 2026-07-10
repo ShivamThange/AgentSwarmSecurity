@@ -1,4 +1,3 @@
-"""Convenience launcher. `python run.py` then open http://127.0.0.1:8000"""
 import uvicorn
 
 if __name__ == "__main__":

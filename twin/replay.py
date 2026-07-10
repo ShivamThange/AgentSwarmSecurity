@@ -1,17 +1,3 @@
-"""Counterfactual replay over the twin (Section 14.1).
-
-This is a *real forward re-simulation*, not a partition heuristic. Nothing else in
-the market can do it because nothing else holds the cross-run state: we take the
-persisted lineage graph, substitute corrected context at the root, and re-run the
-SAME detection code (`detection.assess_span`) node-by-node in topological order,
-feeding each node the corrected outputs of its predecessors.
-
-It is honest about what it is NOT: no agents are re-executed and no new inference
-is spent. We re-derive drift from the twin's own state under the corrected input.
-A node whose contamination was purely INHERITED clears once its upstream is
-cleaned; a node with its OWN intrinsic fault (an injection it originated, or an
-undeclared dangerous tool) stays flagged no matter what upstream does.
-"""
 from __future__ import annotations
 
 import re
@@ -22,9 +8,7 @@ from . import detection
 from .graph import TwinStore
 from .models import DriftStatus, Span, WhatIfPreview
 
-
 def _node_to_span(node, output: str, effects: list[str]) -> Span:
-    """Rebuild a Span view of a stored node so the shared detector can score it."""
     return Span(
         span_id=node.node_id, trace_id=node.trace_id,
         agent_id=node.agent_id, agent_role=node.agent_role, privilege=node.privilege,
@@ -32,13 +16,11 @@ def _node_to_span(node, output: str, effects: list[str]) -> Span:
         tool_calls=node.tool_calls, effects=list(effects), output=output,
     )
 
-
 def _redact(text: str, entities: set[str]) -> str:
     out = text
     for e in sorted(entities, key=len, reverse=True):
         out = re.sub(re.escape(e), "[redacted-by-remediation]", out)
     return out
-
 
 def _original_upstream(store: TwinStore, node_id: str) -> str:
     parts = []
@@ -48,10 +30,7 @@ def _original_upstream(store: TwinStore, node_id: str) -> str:
             parts.append(n.output + " " + " ".join(n.effects))
     return " ".join(parts)
 
-
 def replay(store: TwinStore, root_id: str) -> dict:
-    """Return per-node before/after drift under 'root cleaned'. Keys:
-       order, before{}, after{}, saved[], still_bad[], root_after."""
     root = store.get_node(root_id)
     if root is None:
         return {}
@@ -59,8 +38,6 @@ def replay(store: TwinStore, root_id: str) -> dict:
     radius = set(store.blast_radius(root_id))
     scope = [root_id] + [n for n in store.topo_order() if n in radius]
 
-    # Corrected output text emitted by each replayed node (what the *next* node
-    # downstream would now receive).
     corrected_out: dict[str, str] = {}
     before: dict[str, float] = {}
     after: dict[str, float] = {}
@@ -72,8 +49,6 @@ def replay(store: TwinStore, root_id: str) -> dict:
             continue
         before[nid] = node.drift.score
 
-        # corrected upstream = corrected outputs of predecessors (fall back to
-        # their real output if they were outside the replay scope)
         corr_up = []
         for p in store.predecessors(nid):
             corr_up.append(corrected_out.get(p) or (
@@ -81,7 +56,6 @@ def replay(store: TwinStore, root_id: str) -> dict:
                 if store.get_node(p) else ""))
         corr_up_text = " ".join(corr_up)
 
-        # Which foreign entities did THIS node originate (intrinsic) vs inherit?
         orig_up = _original_upstream(store, nid)
         span_now = _node_to_span(node, node.output, node.effects)
         ents = detection.foreign_entities(span_now)
@@ -98,17 +72,17 @@ def replay(store: TwinStore, root_id: str) -> dict:
         own_fault = undeclared_dangerous or (intrinsic_ents and not is_root)
 
         if is_root:
-            # the root is the remediation target: strip what it introduced
+
             clean_out = _redact(node.output, intrinsic_ents)
             clean_eff = [_redact(e, intrinsic_ents) for e in node.effects]
             corrected_out[nid] = clean_out + " " + " ".join(clean_eff)
         elif own_fault:
-            # keeps its own contamination; only inherited parts would clear
+
             clean_out = _redact(node.output, inherited_ents)
             clean_eff = [_redact(e, inherited_ents) for e in node.effects]
             corrected_out[nid] = node.output + " " + " ".join(node.effects)
         else:
-            # purely inherited: once upstream is clean, its own echo clears too
+
             clean_out = _redact(node.output, ents)
             clean_eff = [_redact(e, ents) for e in node.effects]
             corrected_out[nid] = clean_out + " " + " ".join(clean_eff)
@@ -123,10 +97,7 @@ def replay(store: TwinStore, root_id: str) -> dict:
     drifted_now = [n for n in downstream
                    if store.get_node(n).drift.status in
                    (DriftStatus.FLAGGED, DriftStatus.WATCH)]
-    # "saved" = the inherited contamination lifted (no longer FLAGGED after the
-    # replay). A residual non-contamination signal (e.g. low model confidence)
-    # may leave a node at WATCH; that is a genuine recovery out of the flagged
-    # band, not an intrinsic fault that survives cleaning.
+
     saved = [n for n in drifted_now
              if after_status.get(n) != DriftStatus.FLAGGED]
     still_bad = [n for n in drifted_now if n not in saved]
@@ -141,7 +112,6 @@ def replay(store: TwinStore, root_id: str) -> dict:
         "still_bad": still_bad,
         "root_after": after.get(root_id, 0.0),
     }
-
 
 def build_preview(store: TwinStore, root_id: str) -> WhatIfPreview | None:
     root = store.get_node(root_id)

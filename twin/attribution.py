@@ -1,13 +1,3 @@
-"""Causal attribution & the supervisor narrative (Sections 8.1 / 10).
-
-The same edges that carry propagation also produce the operator's story. Given a
-flagged node we walk edges backward to the *originating* fault, reconstruct the
-propagation path, enumerate the blast radius, and emit a narrative + a set of
-proposed (not yet applied) remediation actions.
-
-This is the UX moat: every stateless tool in Section 9 can only say "Agent 7
-flagged". We say: root cause -> propagation path -> blast radius -> recommended fix.
-"""
 from __future__ import annotations
 
 import uuid
@@ -18,16 +8,12 @@ from .models import (
 )
 from .router import WATCH_THRESHOLD
 
-
 def _drifted(node: TwinNode) -> bool:
     return node.drift.score >= WATCH_THRESHOLD or node.drift.status in (
         DriftStatus.FLAGGED, DriftStatus.WATCH
     )
 
-
 def find_root_cause(store: TwinStore, target_id: str) -> str:
-    """Walk backward: the origin is the earliest drifted node with no drifted
-    ancestor inside the incident set."""
     target = store.get_node(target_id)
     if target is None:
         return target_id
@@ -36,38 +22,28 @@ def find_root_cause(store: TwinStore, target_id: str) -> str:
                if (nd := store.get_node(n)) is not None and _drifted(nd)}
     if not drifted:
         return target_id
-    # a node is the origin if none of its ancestors are also drifted
+
     for n in drifted:
         anc = set(store.upstream(n))
         if not (anc & drifted):
             return n
-    # fallback: earliest by timestamp
+
     return min(drifted, key=lambda n: store.get_node(n).timestamp or 0)
 
-
 _PRIV_RANK = {"high": 2, "medium": 1, "low": 0}
-
 
 def worst_node(store: TwinStore) -> TwinNode | None:
     nodes = [n for n in store.all_nodes() if not n.quarantined]
     if not nodes:
         return None
-    # rank by drift score, breaking ties toward the higher-privilege, later node
-    # so the narrative anchors on the most consequential endpoint of the chain.
+
     return max(nodes, key=lambda n: (
         n.drift.score, _PRIV_RANK.get(n.privilege.value, 0), n.timestamp or 0.0))
 
-
 def propose_remediation(store: TwinStore, root: TwinNode) -> list[RemediationAction]:
-    """Wrap the allow/replace/deny primitives into concrete proposals (8.3).
-
-    Ordered least-to-most invasive. Every one is PROPOSED — human-approved by
-    default (8.4). Nothing here mutates state.
-    """
     actions: list[RemediationAction] = []
     downstream = store.blast_radius(root.node_id)
 
-    # 1. rollback root cause to its last known-good checkpoint
     good = store.latest_good_checkpoint(root.agent_id, (root.timestamp or 0) - 1e-6)
     actions.append(RemediationAction(
         action_id=f"act::{uuid.uuid4().hex[:8]}",
@@ -78,7 +54,7 @@ def propose_remediation(store: TwinStore, root: TwinNode) -> list[RemediationAct
                    f"drift crossed threshold."),
         reversible=True,
     ))
-    # 2. filter the contaminating message on each outgoing influence edge
+
     for dst in store.successors(root.node_id):
         actions.append(RemediationAction(
             action_id=f"act::{uuid.uuid4().hex[:8]}",
@@ -89,7 +65,7 @@ def propose_remediation(store: TwinStore, root: TwinNode) -> list[RemediationAct
                       f"before it propagates further.",
             reversible=True,
         ))
-    # 3. quarantine if it moved a dangerous action or has wide blast radius
+
     if root.privilege.value in ("high", "medium") or len(downstream) >= 2:
         actions.append(RemediationAction(
             action_id=f"act::{uuid.uuid4().hex[:8]}",
@@ -101,7 +77,6 @@ def propose_remediation(store: TwinStore, root: TwinNode) -> list[RemediationAct
             reversible=True,
         ))
     return actions
-
 
 def build_narrative(store: TwinStore, target_id: str | None = None) -> CausalNarrative | None:
     if target_id is None:

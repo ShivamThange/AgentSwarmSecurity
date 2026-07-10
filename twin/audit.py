@@ -1,12 +1,3 @@
-"""Supervisor audit trail — "who watches the watcher" (Section 8.4 / 14.2).
-
-The remediation layer rewrites agents' context, so it is itself a powerful actor.
-Every action it takes is attributable, reversible, and logged in a tamper-evident
-hash chain. A configurable compliance-mapping layer tags each entry against the
-frameworks the buyer is accountable to (EU AI Act, NIST AI RMF, ISO/IEC 42001) —
-data 8.4 already requires, re-projected for GRC (14.2). The mapping is a thin,
-swappable annotation, never baked into the core model.
-"""
 from __future__ import annotations
 
 import hashlib
@@ -18,8 +9,6 @@ from typing import Optional
 
 from .models import AuditEntry
 
-# Configurable compliance mapping (14.2 guardrail: swappable, not hardcoded).
-# event key -> list of "Framework Clause — obligation".
 DEFAULT_COMPLIANCE_MAP: dict[str, list[str]] = {
     "detection": [
         "EU AI Act Art. 15 — accuracy & robustness monitoring",
@@ -52,7 +41,6 @@ DEFAULT_COMPLIANCE_MAP: dict[str, list[str]] = {
     ],
 }
 
-
 class AuditLog:
     def __init__(self, conn: Optional[sqlite3.Connection] = None,
                  compliance_map: Optional[dict[str, list[str]]] = None) -> None:
@@ -76,7 +64,7 @@ class AuditLog:
             self._last_hash = e.hash
 
     def _compliance_tags(self, action: str) -> list[str]:
-        # match on exact key, then on the "prefix.*" family, then the bare prefix
+
         if action in self.compliance_map:
             return list(self.compliance_map[action])
         prefix = action.split(".")[0]
@@ -111,7 +99,6 @@ class AuditLog:
         return list(self._entries)
 
     def reset(self) -> None:
-        """Clear the log (in-memory and persisted) and restart the hash chain."""
         self._entries = []
         self._last_hash = "genesis"
         if self._conn is not None:
@@ -119,7 +106,6 @@ class AuditLog:
             self._conn.commit()
 
     def verify_chain(self) -> bool:
-        """Recompute the hash chain to prove the log has not been tampered with."""
         prev = "genesis"
         for e in self._entries:
             body = json.dumps({
@@ -132,7 +118,6 @@ class AuditLog:
         return True
 
     def compliance_report(self) -> dict:
-        """Aggregate log entries by framework clause — audit-ready on demand."""
         by_clause: dict[str, int] = {}
         for e in self._entries:
             for tag in e.compliance_tags:
