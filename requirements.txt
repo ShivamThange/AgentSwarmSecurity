@@ -1,11 +1,12 @@
-# Core runtime — enough to run the full offline demo + tests (no downloads, no key).
+# Core service runtime.
 fastapi>=0.110
-uvicorn>=0.27
-pydantic>=2.5
+uvicorn[standard]>=0.27
+pydantic>=2.7
+pydantic-settings>=2.2
+SQLAlchemy>=2.0
+psycopg[binary]>=3.1
 numpy>=1.26
-networkx>=3.2
-
-# Optional: enables the online LLM judge tier (hybrid). Safe to install; the judge
-# only activates when LLM_API_KEY is set (see .env.example). Lazy-imported, so its
-# presence never affects the offline path.
+prometheus-client>=0.20
 openai>=1.30
+opentelemetry-proto>=1.25
+protobuf>=4.25

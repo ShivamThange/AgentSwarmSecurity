@@ -1,0 +1,4 @@
+# Semantic embedding backend (pulls torch). Required for the default
+# TWIN_EMBEDDINGS_BACKEND=sentence-transformers; without it, set
+# TWIN_EMBEDDINGS_BACKEND=hashing to run in degraded lexical mode.
+sentence-transformers>=3.0

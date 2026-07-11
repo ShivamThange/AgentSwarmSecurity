@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Optional, Protocol
 
 import numpy as np
 
-from .embeddings import Embedder, default_embedder, distance
-from .models import DeterministicFlag, DriftSignals, JudgeVerdict, Span, Tier
-
-DANGEROUS_TOOLS = {
-    "transfer_funds", "wire_transfer", "make_payment", "delete_records",
-    "drop_table", "write_prod", "deploy", "exfiltrate", "send_email",
-    "http_post", "execute_shell", "grant_access", "disable_guardrail",
-}
+from .config import DEFAULT_DANGEROUS_TOOLS, Settings
+from .embeddings import Embedder, distance
+from .models import (
+    DeterministicFlag, DriftSignals, DriftStatus, JudgeVerdict, Span, Tier,
+)
 
 MUTATING_MARKERS = (
     "added", "created", "deleted", "removed", "transfer", "granted",
@@ -26,15 +24,37 @@ RISK_TOOL_MISUSE = "tool_misuse"
 RISK_CONTEXT_ROT = "context_rot"
 RISK_CONFIDENCE_COLLAPSE = "confidence_collapse"
 
-FLAG_THRESHOLD = 0.60
-WATCH_THRESHOLD = 0.35
-ESCALATE_TO_JUDGE = 0.45
-HARD_FLAG_SEVERITY = 0.85
-
 SVR_UNDECLARED_DANGEROUS = 0.90
 SVR_INJECTION_INTRODUCED = 0.82
 SVR_INJECTION_INHERITED = 0.62
 SVR_FABRICATED_EFFECT = 0.80
+
+
+@dataclass(frozen=True)
+class DetectionPolicy:
+    dangerous_tools: frozenset[str] = frozenset(DEFAULT_DANGEROUS_TOOLS)
+    flag_threshold: float = 0.60
+    watch_threshold: float = 0.35
+    escalate_threshold: float = 0.45
+    hard_flag_severity: float = 0.85
+    prohibition_markers: tuple[str, ...] = (
+        "do not", "don't", "must not", "never", "without moving",
+    )
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "DetectionPolicy":
+        return cls(
+            dangerous_tools=frozenset(settings.dangerous_tools),
+            flag_threshold=settings.flag_threshold,
+            watch_threshold=settings.watch_threshold,
+            escalate_threshold=settings.escalate_threshold,
+            hard_flag_severity=settings.hard_flag_severity,
+            prohibition_markers=tuple(settings.prohibition_markers),
+        )
+
+
+DEFAULT_POLICY = DetectionPolicy()
+
 
 def aggregate(svr: float, traj: float, flags, judge_verdict,
               structural: bool = True) -> float:
@@ -45,6 +65,7 @@ def aggregate(svr: float, traj: float, flags, judge_verdict,
         base = max(base, 0.65 + 0.30 * (judge_verdict.confidence - 0.5))
     return max(0.0, min(1.0, base))
 
+
 def _behaviour_text(span: Span) -> str:
     parts = [span.output]
     for c in span.tool_calls:
@@ -52,9 +73,10 @@ def _behaviour_text(span: Span) -> str:
     parts += span.effects
     return " ".join(p for p in parts if p)
 
-_ACCOUNT_RE = re.compile(r"\b\d{2,}[-/][A-Za-z0-9]{1,6}\b")
 
+_ACCOUNT_RE = re.compile(r"\b\d{2,}[-/][A-Za-z0-9]{1,6}\b")
 _PROPER_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b")
+
 
 def foreign_entities(span: Span) -> set[str]:
     home = (span.task_spec + " " + span.declared_intent).lower()
@@ -68,19 +90,24 @@ def foreign_entities(span: Span) -> set[str]:
             ents.add(m)
     return ents
 
-def injection_is_introduced(span: Span, upstream_texts: Optional[list[str]]) -> bool:
+
+def injection_is_introduced(span: Span,
+                            upstream_texts: Optional[list[str]]) -> bool:
     ents = foreign_entities(span)
     if not ents:
         return False
     up = " ".join(upstream_texts or []).lower()
     return any(e.lower() not in up for e in ents)
 
-def _is_mutating_tool(name: str) -> bool:
-    return name in DANGEROUS_TOOLS or any(
-        v in name for v in ("write", "create", "add", "delete", "update",
-                             "transfer", "grant", "send", "deploy", "remove"))
 
-def run_deterministic(span: Span) -> list[DeterministicFlag]:
+def _is_mutating_tool(name: str, policy: DetectionPolicy) -> bool:
+    return name in policy.dangerous_tools or any(
+        v in name for v in ("write", "create", "add", "delete", "update",
+                            "transfer", "grant", "send", "deploy", "remove"))
+
+
+def run_deterministic(span: Span,
+                      policy: DetectionPolicy) -> list[DeterministicFlag]:
     flags: list[DeterministicFlag] = []
 
     if span.expected_output_schema:
@@ -103,7 +130,7 @@ def run_deterministic(span: Span) -> list[DeterministicFlag]:
     declared = span.declared_intent.lower()
     task = span.task_spec.lower()
     for call in span.tool_calls:
-        if call.name in DANGEROUS_TOOLS:
+        if call.name in policy.dangerous_tools:
             justified = call.name.replace("_", " ") in declared or \
                 call.name.replace("_", " ") in task or call.name in declared
             sev = 0.9 if not justified else 0.4
@@ -114,7 +141,8 @@ def run_deterministic(span: Span) -> list[DeterministicFlag]:
                 severity=sev,
             ))
 
-    has_mutating_tool = any(_is_mutating_tool(c.name) for c in span.tool_calls)
+    has_mutating_tool = any(_is_mutating_tool(c.name, policy)
+                            for c in span.tool_calls)
     for eff in span.effects:
         e = eff.lower()
         if any(m in e for m in MUTATING_MARKERS) and not has_mutating_tool:
@@ -136,18 +164,20 @@ def run_deterministic(span: Span) -> list[DeterministicFlag]:
             ))
     return flags
 
+
 def stated_vs_revealed_gap(
     span: Span,
-    emb: Embedder = default_embedder,
+    emb: Embedder,
+    policy: DetectionPolicy,
     upstream_texts: Optional[list[str]] = None,
 ) -> tuple[float, str, str]:
     behaviour = _behaviour_text(span)
     if not span.declared_intent.strip() or not behaviour.strip():
         return 0.0, "insufficient text for stated-vs-revealed comparison", ""
 
-    lexical = distance(emb.encode(span.declared_intent), emb.encode(behaviour))
-    gap = lexical
-    primary = "lexical"
+    semantic = distance(emb.encode(span.declared_intent), emb.encode(behaviour))
+    gap = semantic
+    primary = "semantic"
     reasons: list[str] = []
     declared = span.declared_intent.lower()
 
@@ -164,7 +194,8 @@ def stated_vs_revealed_gap(
                 gap, primary = SVR_INJECTION_INHERITED, "injection_inherited"
             reasons.append(f"carries foreign entity from upstream ({shown})")
 
-    has_mutating_tool = any(_is_mutating_tool(c.name) for c in span.tool_calls)
+    has_mutating_tool = any(_is_mutating_tool(c.name, policy)
+                            for c in span.tool_calls)
     if any(any(m in eff.lower() for m in MUTATING_MARKERS) for eff in span.effects) \
             and not has_mutating_tool:
         if SVR_FABRICATED_EFFECT > gap:
@@ -172,7 +203,8 @@ def stated_vs_revealed_gap(
         reasons.append("mutating effect with no mutating tool call")
 
     for c in span.tool_calls:
-        if c.name in DANGEROUS_TOOLS and c.name.replace("_", " ") not in declared \
+        if c.name in policy.dangerous_tools \
+                and c.name.replace("_", " ") not in declared \
                 and c.name not in declared:
             if SVR_UNDECLARED_DANGEROUS > gap:
                 gap, primary = SVR_UNDECLARED_DANGEROUS, "undeclared_dangerous_tool"
@@ -180,12 +212,13 @@ def stated_vs_revealed_gap(
 
     struct = "; ".join(reasons) if reasons else "no structural divergence"
     note = (f"stated-vs-revealed = {gap:.2f} "
-            f"[primary: {primary}; lexical {lexical:.2f} (illustrative); {struct}]")
+            f"[primary: {primary}; semantic {semantic:.2f}; {struct}]")
     return gap, note, primary
+
 
 def trajectory_drift_score(
     span: Span,
-    emb: Embedder = default_embedder,
+    emb: Embedder,
     task_anchor: Optional[np.ndarray] = None,
 ) -> float:
     if task_anchor is None:
@@ -197,26 +230,29 @@ def trajectory_drift_score(
         return 0.0
     return distance(task_anchor, emb.encode(reasoning))
 
+
 class Judge(Protocol):
     def assess(self, span: Span, signals: DriftSignals) -> JudgeVerdict: ...
 
-class StubJudge:
 
+class StubJudge:
     INJECTION_MARKERS = (
         "ignore previous", "ignore all previous", "new instructions",
         "system override", "disregard", "actually your real goal",
         "forget the task", "you are now",
     )
 
+    def __init__(self, policy: DetectionPolicy = DEFAULT_POLICY) -> None:
+        self.policy = policy
+
     def assess(self, span: Span, signals: DriftSignals) -> JudgeVerdict:
         text = (span.declared_intent + " " + span.output + " " +
                 _behaviour_text(span)).lower()
         markers = any(m in text for m in self.INJECTION_MARKERS)
-
         introduced = signals.injection_introduced
-
-        structural = signals.svr_primary not in ("", "lexical")
-        hard_flag = any(f.severity >= HARD_FLAG_SEVERITY for f in signals.deterministic)
+        structural = signals.svr_primary not in ("", "semantic", "lexical")
+        hard_flag = any(f.severity >= self.policy.hard_flag_severity
+                        for f in signals.deterministic)
 
         if introduced or structural or hard_flag:
             conf = 0.9 if markers else 0.82
@@ -234,13 +270,13 @@ class StubJudge:
             serves_goal=True, confidence=0.7,
             rationale="step remains consistent with the stated goal.")
 
-default_judge: Judge = StubJudge()
 
-def classify_risk(span: Span, signals: DriftSignals) -> Optional[str]:
-
+def classify_risk(span: Span, signals: DriftSignals,
+                  policy: DetectionPolicy) -> Optional[str]:
     if signals.injection_introduced:
         return RISK_PROMPT_INJECTION
-    if any(f.rule == "sensitive_tool_call" and f.severity >= HARD_FLAG_SEVERITY
+    if any(f.rule == "sensitive_tool_call"
+           and f.severity >= policy.hard_flag_severity
            for f in signals.deterministic):
         return RISK_TOOL_MISUSE
     if any(f.rule == "fabricated_effect" for f in signals.deterministic):
@@ -257,16 +293,21 @@ def classify_risk(span: Span, signals: DriftSignals) -> Optional[str]:
         return RISK_HALLUCINATION
     return None
 
+
 def assess_span(
     span: Span,
-    emb: Embedder = default_embedder,
-    judge: Judge = default_judge,
+    emb: Embedder,
+    judge: Optional[Judge] = None,
+    policy: DetectionPolicy = DEFAULT_POLICY,
     upstream_texts: Optional[list[str]] = None,
     anchor_vec: Optional[np.ndarray] = None,
 ) -> DriftSignals:
+    if judge is None:
+        judge = StubJudge(policy)
     signals = DriftSignals()
-    signals.deterministic = run_deterministic(span)
-    svr, svr_note, primary = stated_vs_revealed_gap(span, emb, upstream_texts)
+    signals.deterministic = run_deterministic(span, policy)
+    svr, svr_note, primary = stated_vs_revealed_gap(
+        span, emb, policy, upstream_texts)
     traj = trajectory_drift_score(span, emb, anchor_vec)
     signals.stated_vs_revealed = round(svr, 3)
     signals.trajectory_drift = round(traj, 3)
@@ -275,9 +316,8 @@ def assess_span(
     signals.injection_introduced = injection_is_introduced(span, upstream_texts)
 
     det_max = max((f.severity for f in signals.deterministic), default=0.0)
-    hard_flag = det_max >= HARD_FLAG_SEVERITY
-    structural = primary not in ("", "lexical")
-    cheap_score = aggregate(svr, traj, signals.deterministic, None, structural)
+    hard_flag = det_max >= policy.hard_flag_severity
+    structural = primary not in ("", "semantic", "lexical")
 
     if structural or hard_flag or det_max >= 0.5:
         signals.judge = judge.assess(span, signals)
@@ -287,15 +327,14 @@ def assess_span(
 
     final = aggregate(svr, traj, signals.deterministic, signals.judge, structural)
     signals.score = round(final, 3)
-    from .models import DriftStatus
-    if final >= FLAG_THRESHOLD:
+    if final >= policy.flag_threshold:
         signals.status = DriftStatus.FLAGGED
-    elif final >= WATCH_THRESHOLD:
+    elif final >= policy.watch_threshold:
         signals.status = DriftStatus.WATCH
     else:
         signals.status = DriftStatus.OK
 
-    signals.risk_type = (classify_risk(span, signals)
+    signals.risk_type = (classify_risk(span, signals, policy)
                          if signals.status != DriftStatus.OK else None)
 
     from . import taxonomy
