@@ -56,6 +56,10 @@ class Span(BaseModel):
 
     declared_intent: str = ""
 
+    # Optional workflow-type label used to select a detection threshold
+    # profile (e.g. "finance", "support"). Empty selects the global policy.
+    workflow: str = ""
+
     tool_calls: list[ToolCall] = Field(default_factory=list)
     effects: list[str] = Field(default_factory=list)
     output: str = ""
@@ -108,6 +112,7 @@ class TwinNode(BaseModel):
     agent_role: str = ""
     privilege: Privilege = Privilege.LOW
     task: str = ""
+    workflow: str = ""
 
     declared_intent: str = ""
     tool_calls: list[ToolCall] = Field(default_factory=list)
