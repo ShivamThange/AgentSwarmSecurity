@@ -1,0 +1,27 @@
+# Optional external integrations wired behind the twin's internal seams.
+# NONE of these are required to run: every adapter degrades to the native
+# deterministic component when its package is absent (verify with
+# `python scripts/validate_boundary.py`). Install only the ones you enable.
+
+# --- Judge backend: TWIN_JUDGE_BACKEND=llamafirewall ---
+# Meta LlamaFirewall — AlignmentCheck + PromptGuard scanners behind
+# detection.Judge. AlignmentCheck may require a local or hosted model; see the
+# LlamaFirewall docs for on-prem model configuration.
+llamafirewall>=1.0
+
+# --- Inline rail backend: TWIN_GUARD_BACKEND=nemo (+ TWIN_NEMO_CONFIG_PATH) ---
+# NVIDIA NeMo Guardrails — Colang rails layered over the native rail.
+nemoguardrails>=0.11
+
+# --- Telemetry substrate: point Phoenix / Langfuse OTLP exporters at
+#     /v1/traces. The twin already parses their span conventions natively;
+#     these are only needed to run the tools themselves. ---
+arize-phoenix>=7.0
+openinference-semantic-conventions>=0.1
+langfuse>=2.0
+
+# --- Agent-framework handoff tap (twin.integrations.handoff) ---
+# The converters accept plain dict/message shapes, so these are needed only in
+# the agent process that emits spans, not by the twin service.
+ag2>=0.7
+langgraph>=0.2
