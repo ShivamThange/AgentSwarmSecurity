@@ -108,6 +108,21 @@ class ApiKeyRow(Base):
     last_used_ts: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
 
+class FeedbackLabelRow(Base):
+    """Human review verdict on a detection, used to calibrate thresholds."""
+
+    __tablename__ = "feedback_labels"
+
+    node_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    label: Mapped[str] = mapped_column(String(32), index=True)
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    workflow: Mapped[str] = mapped_column(String(128), default="", index=True)
+    drift_status: Mapped[str] = mapped_column(String(16), default="")
+    labeled_by: Mapped[str] = mapped_column(String(256), default="")
+    note: Mapped[str] = mapped_column(Text, default="")
+    ts: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+
+
 class MetaRow(Base):
     __tablename__ = "meta"
 
