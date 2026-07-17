@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Protocol
 
 import numpy as np
@@ -54,6 +55,54 @@ class DetectionPolicy:
 
 
 DEFAULT_POLICY = DetectionPolicy()
+
+log = logging.getLogger(__name__)
+
+_TUNABLE_THRESHOLDS = (
+    "flag_threshold", "watch_threshold", "escalate_threshold",
+    "hard_flag_severity",
+)
+
+
+class PolicyResolver:
+    """Selects a :class:`DetectionPolicy` per span from workflow profiles.
+
+    Profiles override only the tunable thresholds; the rest of the policy
+    (dangerous tools, prohibition markers) is inherited from the base. Resolved
+    policies are cached, and an unknown/empty workflow returns the base policy
+    unchanged so behaviour is identical to a single global policy when no
+    profiles are configured.
+    """
+
+    def __init__(self, base: DetectionPolicy,
+                 profiles: Optional[dict[str, dict[str, float]]] = None) -> None:
+        self.base = base
+        self.profiles = profiles or {}
+        self._cache: dict[str, DetectionPolicy] = {}
+
+    def resolve(self, workflow: Optional[str]) -> DetectionPolicy:
+        if not workflow or workflow not in self.profiles:
+            return self.base
+        cached = self._cache.get(workflow)
+        if cached is not None:
+            return cached
+        overrides = {}
+        for key, val in self.profiles[workflow].items():
+            if key in _TUNABLE_THRESHOLDS:
+                try:
+                    overrides[key] = float(val)
+                except (TypeError, ValueError):
+                    log.warning("ignoring non-numeric threshold '%s'=%r in "
+                                "profile '%s'", key, val, workflow)
+            else:
+                log.warning("ignoring unknown threshold key '%s' in profile "
+                            "'%s'", key, workflow)
+        policy = replace(self.base, **overrides) if overrides else self.base
+        self._cache[workflow] = policy
+        return policy
+
+    def known_profiles(self) -> list[str]:
+        return sorted(self.profiles)
 
 
 def aggregate(svr: float, traj: float, flags, judge_verdict,
