@@ -275,6 +275,27 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(404, f"node {root_id} not found")
         return wi.model_dump(mode="json")
 
+    @app.post("/api/nodes/{node_id}/label")
+    def api_label(request: Request, node_id: str, payload: dict = Body(...),
+                  p: Principal = require("operate")):
+        label = str(payload.get("label", "")).strip()
+        note = str(payload.get("note", "") or "")
+        try:
+            return engine_of(request).label_node(node_id, label, p.name,
+                                                 note=note)
+        except KeyError:
+            raise HTTPException(404, f"node {node_id} not found")
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+
+    @app.get("/api/calibration")
+    def api_calibration(request: Request,
+                        target_precision: Optional[float] = Query(
+                            None, ge=0.0, le=1.0),
+                        _p: Principal = require("read")):
+        return engine_of(request).calibration_report(
+            target_precision=target_precision)
+
     @app.get("/api/guard")
     def api_guard(request: Request,
                   limit: int = Query(100, ge=1, le=1000),
@@ -285,6 +306,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/api/cost")
     def api_cost(request: Request, _p: Principal = require("read")):
         return engine_of(request).cost()
+
+    @app.get("/api/escalation")
+    def api_escalation(request: Request, _p: Principal = require("read")):
+        return engine_of(request).escalation_report()
 
     # --- remediation ---
 
@@ -365,6 +390,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/api/compliance")
     def api_compliance(request: Request, _p: Principal = require("read")):
         return engine_of(request).compliance()
+
+    @app.get("/api/compliance/map")
+    def api_compliance_map(request: Request, _p: Principal = require("read")):
+        return engine_of(request).audit.active_map()
 
     # --- admin ---
 
