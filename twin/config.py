@@ -49,6 +49,20 @@ class Settings(BaseSettings):
     llm_timeout: float = 20.0
     llm_max_retries: int = 2
 
+    # Judge backend selection. "llm" (default) uses the OpenAI-compatible
+    # judges; "llamafirewall" runs Meta's LlamaFirewall scanners as the small
+    # tier (LLM judge stays as the deep tier when a key is configured);
+    # "stub" forces the deterministic judge only.
+    judge_backend: Literal["llm", "llamafirewall", "stub"] = "llm"
+    llamafirewall_scanners: list[str] = Field(
+        default_factory=lambda: ["prompt_guard", "alignment_check"])
+
+    # Inline rail backend. "native" (default) is the deterministic
+    # zero-inference gate; "nemo" layers NVIDIA NeMo Guardrails advisory
+    # denials on top of it (requires TWIN_NEMO_CONFIG_PATH).
+    guard_backend: Literal["native", "nemo"] = "native"
+    nemo_config_path: Optional[str] = None
+
     flag_threshold: float = 0.60
     watch_threshold: float = 0.35
     escalate_threshold: float = 0.45
@@ -62,10 +76,30 @@ class Settings(BaseSettings):
 
     detection_cache_size: int = 4096
 
+    # Escalation-rate anomaly monitor (guards the paid judge tier against
+    # adversarial flooding). ratio = escalated / analysed spans in the window.
+    escalation_window_seconds: float = 300.0
+    escalation_ratio_threshold: float = 0.5
+    escalation_rate_threshold_per_min: Optional[float] = None
+    escalation_min_samples: int = 20
+
+    # Per-workflow threshold overrides, keyed by Span.workflow. JSON env, e.g.
+    # TWIN_THRESHOLD_PROFILES={"finance":{"flag_threshold":0.5}}. Recognised
+    # keys: flag_threshold, watch_threshold, escalate_threshold,
+    # hard_flag_severity.
+    threshold_profiles: dict[str, dict[str, float]] = Field(
+        default_factory=dict)
+
     retention_days: Optional[int] = None
 
     metrics_enabled: bool = True
     cors_origins: list[str] = Field(default_factory=list)
+
+    # Optional path to a JSON file mapping audit action -> list of compliance
+    # clauses. Entries merge over (and override) the built-in EU AI Act / NIST
+    # AI RMF / ISO 42001 defaults, so an org can add its own framework without
+    # forking the code.
+    compliance_map_path: Optional[str] = None
 
     log_level: str = "INFO"
     log_json: bool = True
@@ -74,6 +108,7 @@ class Settings(BaseSettings):
     port: int = 8000
 
     @field_validator("dangerous_tools", "prohibition_markers", "cors_origins",
+                     "llamafirewall_scanners",
                      mode="before")
     @classmethod
     def _split_csv(cls, v):
