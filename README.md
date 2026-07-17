@@ -107,11 +107,16 @@ Native span (`POST /api/spans`, JSON array):
 OTLP (`POST /v1/traces`, protobuf or JSON): standard OTel span identity plus
 attributes. Recognised attributes, in precedence order: `twin.*`
 (`twin.agent_id`, `twin.task_spec`, `twin.declared_intent`, `twin.output`,
-`twin.effects`, `twin.tool_calls`, `twin.privilege`, `twin.inputs_from`),
-then `gen_ai.*` (agent name, tool name/arguments, completion, usage tokens),
-then OpenInference (`tool.name`, `output.value`, `llm.token_count.*`).
-Span links and the parent span become influence edges. Reported usage tokens
-feed the measured monitoring-overhead figure at `GET /api/cost`.
+`twin.effects`, `twin.tool_calls`, `twin.privilege`, `twin.inputs_from`,
+`twin.workflow`), then `gen_ai.*` (agent name, tool name/arguments,
+completion, usage tokens), then **OpenInference / Phoenix** (`input.value`,
+`output.value`, `llm.input_messages.*` / `llm.output_messages.*` incl. tool
+calls, `llm.token_count.*`, `graph.node.id` / `graph.node.parent_id` for
+LangGraph) and **Langfuse** (`langfuse.observation.input` / `.output` /
+`.type`, `langfuse.trace.name`). Point a Phoenix or Langfuse OTLP exporter
+straight at `/v1/traces` and it maps without extra glue. Span links and the
+parent span become influence edges. Reported usage tokens feed the measured
+monitoring-overhead figure at `GET /api/cost`.
 
 ## Key endpoints
 
@@ -122,10 +127,43 @@ feed the measured monitoring-overhead figure at `GET /api/cost`.
 | `GET /api/whatif/{node}` | counterfactual containment preview |
 | `GET/POST /api/remediation...` | proposal + approve/reject/revert lifecycle |
 | `GET /api/guard` | tool calls denied by the inline rail |
+| `GET /api/escalation` | rolling escalation-rate + anomaly monitor |
+| `POST /api/nodes/{id}/label` | human review verdict (true/false positive) |
+| `GET /api/calibration` | threshold recommendations from labels (per workflow) |
 | `GET /api/audit`, `/api/audit/verify` | hash-chained audit log + verification |
-| `GET /api/compliance` | audit coverage per compliance clause |
+| `GET /api/compliance`, `/api/compliance/map` | audit coverage + active clause map |
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/health` | liveness/readiness (DB check) |
+
+## Optional integrations
+
+External tools plug in behind internal seams and are **off by default**. None
+are required: each adapter degrades to its native component (and logs it) when
+the package is absent. Install with `pip install -r requirements-integrations.txt`
+and verify the wiring and the defensible core with:
+
+```bash
+python scripts/validate_boundary.py     # asserts C1–C5 stay twin-native
+```
+
+| Integration | Enable | Falls back to |
+| --- | --- | --- |
+| **LlamaFirewall** judge (AlignmentCheck + PromptGuard) | `TWIN_JUDGE_BACKEND=llamafirewall` | deterministic `StubJudge` |
+| **NeMo Guardrails** inline rail | `TWIN_GUARD_BACKEND=nemo` + `TWIN_NEMO_CONFIG_PATH` | native deterministic rail (always authoritative) |
+| **Phoenix / Langfuse** telemetry | point their OTLP exporter at `/v1/traces` | native OTLP parsing |
+| **AutoGen / LangGraph** handoff tap | `from twin.integrations.handoff import from_autogen_messages, from_langgraph_updates, TwinTap` | — (client-side helper) |
+
+Two more calibration/robustness features are always on:
+
+- **Per-workflow thresholds** — set `TWIN_THRESHOLD_PROFILES` (JSON) to tune
+  detection per `Span.workflow`; label detections via `POST /api/nodes/{id}/label`
+  and read data-driven threshold recommendations at `GET /api/calibration`.
+- **Escalation-rate anomaly monitor** — guards the paid judge tier against
+  adversarial flooding; tune `TWIN_ESCALATION_*`, watch `GET /api/escalation`
+  and the `twin_escalation_*` metrics.
+- **Swappable compliance map** — override the built-in EU AI Act / NIST AI RMF
+  / ISO 42001 clauses with `TWIN_COMPLIANCE_MAP_PATH` (JSON, merges over
+  defaults); inspect the active map at `GET /api/compliance/map`.
 
 ## Production notes
 
