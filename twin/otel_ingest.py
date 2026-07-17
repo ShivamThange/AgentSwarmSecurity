@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from .models import Privilege, Span, ToolCall
@@ -10,6 +11,18 @@ log = logging.getLogger(__name__)
 
 PROTOBUF_CONTENT_TYPE = "application/x-protobuf"
 JSON_CONTENT_TYPE = "application/json"
+
+# Flattened OpenInference message attribute, e.g.
+#   llm.output_messages.0.message.content
+_MSG_PREFIX_RE = re.compile(r"^llm\.(input|output)_messages\.(\d+)\.message\.")
+
+
+def _first(attrs: dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        v = attrs.get(k)
+        if v is not None and v != "":
+            return v
+    return None
 
 
 class OTLPParseError(ValueError):
@@ -83,6 +96,85 @@ def _as_str(value: Any) -> str:
     return json.dumps(value, default=str)
 
 
+def _indexed_messages(
+    attrs: dict[str, Any], kind: str
+) -> tuple[dict[int, dict[str, Any]], dict[int, dict[int, dict[str, Any]]]]:
+    """Reassemble OpenInference flattened chat messages of one ``kind``.
+
+    Returns ``(messages, tool_calls)`` where ``messages`` maps message index to
+    ``{"role", "content"}`` and ``tool_calls`` maps message index to a dict of
+    tool-call index -> ``{"name", "arguments"}``.
+    """
+    prefix = f"llm.{kind}_messages."
+    messages: dict[int, dict[str, Any]] = {}
+    tool_calls: dict[int, dict[int, dict[str, Any]]] = {}
+    for key, val in attrs.items():
+        if not key.startswith(prefix):
+            continue
+        parts = key[len(prefix):].split(".")
+        if len(parts) < 3 or parts[1] != "message":
+            continue
+        try:
+            midx = int(parts[0])
+        except ValueError:
+            continue
+        field = parts[2]
+        if field in ("content", "role"):
+            messages.setdefault(midx, {})[field] = _as_str(val)
+        elif (field == "tool_calls" and len(parts) >= 7
+              and parts[4] == "tool_call" and parts[5] == "function"):
+            try:
+                tcidx = int(parts[3])
+            except ValueError:
+                continue
+            tc = tool_calls.setdefault(midx, {}).setdefault(tcidx, {})
+            if parts[6] == "name":
+                tc["name"] = _as_str(val)
+            elif parts[6] == "arguments":
+                tc["arguments"] = val
+    return messages, tool_calls
+
+
+def _message_content(attrs: dict[str, Any], kind: str,
+                     role: Optional[str] = None) -> str:
+    messages, _ = _indexed_messages(attrs, kind)
+    if not messages:
+        return ""
+    candidates = sorted(messages.items())
+    if role is not None:
+        matching = [(i, m) for i, m in candidates
+                    if str(m.get("role", "")).lower() == role]
+        if matching:
+            candidates = matching
+    for _idx, msg in reversed(candidates):
+        content = msg.get("content")
+        if content:
+            return content
+    return ""
+
+
+def _openinference_tool_calls(attrs: dict[str, Any]) -> list[ToolCall]:
+    _, tool_calls = _indexed_messages(attrs, "output")
+    calls: list[ToolCall] = []
+    for _midx, tcs in sorted(tool_calls.items()):
+        for _tcidx, tc in sorted(tcs.items()):
+            name = tc.get("name")
+            if not name:
+                continue
+            args: dict[str, Any] = {}
+            raw_args = tc.get("arguments")
+            if raw_args:
+                try:
+                    parsed = (json.loads(raw_args) if isinstance(raw_args, str)
+                              else raw_args)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            calls.append(ToolCall(name=str(name), args=args))
+    return calls
+
+
 def _tool_calls_from(attrs: dict[str, Any]) -> list[ToolCall]:
     raw = attrs.get("twin.tool_calls")
     calls: list[ToolCall] = []
@@ -114,7 +206,25 @@ def _tool_calls_from(attrs: dict[str, Any]) -> list[ToolCall]:
             except (json.JSONDecodeError, TypeError):
                 pass
         calls.append(ToolCall(name=str(tool_name), args=args))
-    return calls
+        return calls
+
+    # OpenInference / Langfuse LLM spans carry tool calls inside the flattened
+    # output-message attributes.
+    return _openinference_tool_calls(attrs)
+
+
+def _instrumentation_vendor(attrs: dict[str, Any]) -> Optional[str]:
+    for key in attrs:
+        if key.startswith("langfuse."):
+            return "langfuse"
+    for key in attrs:
+        if key.startswith("openinference.") or key.startswith("llm.") \
+                or key.startswith("input.") or key.startswith("output."):
+            return "openinference"
+    for key in attrs:
+        if key.startswith("gen_ai."):
+            return "otel-genai"
+    return None
 
 
 def _privilege_from(attrs: dict[str, Any]) -> Privilege:
@@ -151,23 +261,26 @@ def _map_span(trace_id: str, span_id: str, parent_span_id: Optional[str],
               link_span_ids: list[str],
               resource_attrs: dict[str, Any]) -> Span:
     agent_id = _as_str(
-        attrs.get("twin.agent_id")
-        or attrs.get("gen_ai.agent.name")
-        or attrs.get("gen_ai.agent.id")
+        _first(attrs, "twin.agent_id", "gen_ai.agent.name", "gen_ai.agent.id",
+               "graph.node.id", "langfuse.trace.name")
         or resource_attrs.get("service.name")
         or "unknown-agent")
-    task_spec = _as_str(attrs.get("twin.task_spec")
-                        or attrs.get("gen_ai.agent.task")
-                        or name)
-    output = _as_str(attrs.get("twin.output")
-                     or attrs.get("gen_ai.completion")
-                     or attrs.get("output.value"))
+    task_spec = _as_str(
+        _first(attrs, "twin.task_spec", "gen_ai.agent.task", "input.value",
+               "langfuse.observation.input")
+        or _message_content(attrs, "input", role="user")
+        or name)
+    output = _as_str(
+        _first(attrs, "twin.output", "gen_ai.completion", "output.value",
+               "langfuse.observation.output")
+        or _message_content(attrs, "output"))
 
     inputs_from = [str(x) for x in _as_list(attrs.get("twin.inputs_from"))]
     if not inputs_from:
         inputs_from = list(link_span_ids)
-        if parent_span_id:
-            inputs_from.append(parent_span_id)
+        parent = parent_span_id or _as_str(attrs.get("graph.node.parent_id"))
+        if parent:
+            inputs_from.append(parent)
     inputs_from = list(dict.fromkeys(x for x in inputs_from if x))
 
     logprob = attrs.get("twin.logprob_confidence")
@@ -180,6 +293,9 @@ def _map_span(trace_id: str, span_id: str, parent_span_id: Optional[str],
               _as_list(attrs.get("twin.expected_output_schema"))] or None
 
     meta: dict[str, Any] = {"source": "otlp", "otel_span_name": name}
+    vendor = _instrumentation_vendor(attrs)
+    if vendor:
+        meta["instrumentation"] = vendor
     baseline = _baseline_tokens(attrs)
     if baseline > 0:
         meta["baseline_tokens"] = baseline
@@ -192,10 +308,12 @@ def _map_span(trace_id: str, span_id: str, parent_span_id: Optional[str],
         trace_id=trace_id,
         parent_span_id=parent_span_id,
         agent_id=agent_id,
-        agent_role=_as_str(attrs.get("twin.agent_role")
-                           or attrs.get("gen_ai.agent.description")),
+        agent_role=_as_str(
+            _first(attrs, "twin.agent_role", "gen_ai.agent.description",
+                   "openinference.span.kind", "langfuse.observation.type")),
         privilege=_privilege_from(attrs),
         task_spec=task_spec,
+        workflow=_as_str(attrs.get("twin.workflow", "")),
         declared_intent=_as_str(attrs.get("twin.declared_intent")),
         tool_calls=_tool_calls_from(attrs),
         effects=[_as_str(x) for x in _as_list(attrs.get("twin.effects"))],
