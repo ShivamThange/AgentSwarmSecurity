@@ -127,20 +127,41 @@ class JudgePair:
         return total
 
     def info(self) -> dict:
+        small_info = getattr(self.small, "info", None)
+        backend = (small_info().get("backend") if callable(small_info)
+                   else None)
+        resolved = backend or ("llm" if self.enabled else "deterministic")
         return {
             "enabled": self.enabled,
+            "backend": resolved,
             "small_model": getattr(self.small, "model", None),
             "deep_model": getattr(self.deep, "model", None),
-            "mode": "llm" if self.enabled else "deterministic-fallback",
+            "mode": resolved if self.enabled else "deterministic-fallback",
         }
 
 
 def build_judges(settings: Settings, policy: DetectionPolicy) -> JudgePair:
+    backend = settings.judge_backend
+
+    if backend == "stub":
+        return JudgePair(small=StubJudge(policy), deep=None, enabled=False)
+
+    if backend == "llamafirewall":
+        from .integrations.llamafirewall_judge import LlamaFirewallJudge
+        small = LlamaFirewallJudge(settings, policy)
+        # Keep an LLM as the deep escalation tier when one is configured;
+        # otherwise the firewall verdict is final.
+        deep = (OpenAICompatibleJudge(settings, policy, deep=True)
+                if settings.llm_enabled else None)
+        return JudgePair(small=small, deep=deep, enabled=True)
+
     if settings.llm_enabled:
         small = OpenAICompatibleJudge(settings, policy, deep=False)
         deep = OpenAICompatibleJudge(settings, policy, deep=True)
         return JudgePair(small=small, deep=deep, enabled=True)
+
     log.warning(
         "no LLM_API_KEY configured — judge tiers run on the deterministic "
-        "StubJudge fallback; configure TWIN_LLM_API_KEY for production")
+        "StubJudge fallback; configure TWIN_LLM_API_KEY or set "
+        "TWIN_JUDGE_BACKEND=llamafirewall for production")
     return JudgePair(small=StubJudge(policy), deep=None, enabled=False)
