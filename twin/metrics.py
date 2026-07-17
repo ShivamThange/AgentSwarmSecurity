@@ -41,6 +41,14 @@ HTTP_REQUESTS = Histogram(
     ["method", "route", "code"],
     buckets=(0.005, 0.025, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
 )
+ESCALATION_RATIO = Gauge(
+    "twin_escalation_ratio",
+    "Fraction of analysed spans escalated to a judge tier in the window",
+)
+ESCALATION_ANOMALIES = Counter(
+    "twin_escalation_anomalies_total",
+    "Times the escalation-rate monitor raised an anomaly",
+)
 READY = Gauge("twin_ready", "1 when the service is ready to serve traffic")
 
 
