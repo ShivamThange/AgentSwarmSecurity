@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from typing import Optional
@@ -11,6 +12,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .db import AuditHeadRow, AuditRow
 from .models import AuditEntry
+
+log = logging.getLogger(__name__)
 
 DEFAULT_COMPLIANCE_MAP: dict[str, list[str]] = {
     "detection": [
@@ -51,7 +54,44 @@ DEFAULT_COMPLIANCE_MAP: dict[str, list[str]] = {
     "retention": [
         "EU AI Act Art. 12 — record-keeping policy",
     ],
+    "feedback": [
+        "EU AI Act Art. 14 — human oversight",
+        "NIST AI RMF MEASURE-4 — feedback from human review",
+        "ISO/IEC 42001 A.6.2.8 — continual improvement from monitoring",
+    ],
 }
+
+
+def load_compliance_map(path: Optional[str]) -> dict[str, list[str]]:
+    """Merge a JSON compliance map from ``path`` over the built-in defaults.
+
+    The file is ``{action_or_prefix: [clause, ...]}``. Its entries override
+    matching default keys and add new ones. A missing path returns the defaults
+    unchanged; a malformed file logs and falls back to the defaults so a bad
+    config can never wipe the audit trail's compliance annotations.
+    """
+    merged: dict[str, list[str]] = {k: list(v)
+                                    for k, v in DEFAULT_COMPLIANCE_MAP.items()}
+    if not path:
+        return merged
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError("compliance map must be a JSON object")
+        for action, clauses in data.items():
+            if not isinstance(clauses, list) or not all(
+                    isinstance(c, str) for c in clauses):
+                raise ValueError(
+                    f"compliance map entry '{action}' must be a list of "
+                    f"strings")
+            merged[str(action)] = list(clauses)
+        log.info("loaded compliance map overrides from %s (%d entries)",
+                 path, len(data))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        log.warning("failed to load compliance map from %s (%s: %s); using "
+                    "built-in defaults", path, type(exc).__name__, exc)
+    return merged
 
 
 def _body(actor: str, action: str, target: str, detail: str, ts: float,
@@ -161,6 +201,16 @@ class AuditLog:
         head_ok = head is not None and (checked == 0 or head.last_hash == prev)
         return {"valid": head_ok, "checked": checked, "broken_at_seq": None,
                 "broken_entry_id": None}
+
+    def active_map(self) -> dict:
+        clauses = sorted({c for tags in self.compliance_map.values()
+                          for c in tags})
+        return {
+            "actions": {k: list(v) for k, v in
+                        sorted(self.compliance_map.items())},
+            "clauses": clauses,
+            "clause_count": len(clauses),
+        }
 
     def compliance_report(self) -> dict:
         by_clause: dict[str, int] = {}
