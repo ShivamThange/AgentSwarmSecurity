@@ -5,9 +5,10 @@ import threading
 import time
 from collections import OrderedDict
 
-from . import detection, guard
-from .detection import DetectionPolicy
+from . import detection
+from .detection import DetectionPolicy, PolicyResolver
 from .embeddings import Embedder
+from .guard import GuardBackend, NativeGuard
 from .llm import JudgePair
 from .models import (
     DriftSignals, DriftStatus, Privilege, Span, Tier, TwinEdge, TwinNode,
@@ -53,11 +54,15 @@ class CostRouter:
     def __init__(self, store: TwinStore, emb: Embedder, judges: JudgePair,
                  policy: DetectionPolicy,
                  low_sample_rate: int = 3,
-                 cache_size: int = 4096) -> None:
+                 cache_size: int = 4096,
+                 guard: GuardBackend | None = None,
+                 resolver: PolicyResolver | None = None) -> None:
         self.store = store
         self.emb = emb
         self.judges = judges
         self.policy = policy
+        self.resolver = resolver or PolicyResolver(policy)
+        self.guard = guard or NativeGuard(policy)
         self.low_sample_rate = max(1, low_sample_rate)
         self._cache = _SignalsCache(cache_size)
 
@@ -70,7 +75,8 @@ class CostRouter:
 
     def _cache_key(self, span: Span) -> str:
         payload = span.declared_intent + "||" + \
-            detection._behaviour_text(span) + "||" + span.task_spec
+            detection._behaviour_text(span) + "||" + span.task_spec + \
+            "||" + (span.workflow or "")
         return hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
 
     def _upstream_texts(self, span: Span) -> list[str]:
@@ -78,6 +84,7 @@ class CostRouter:
         return [n.output + " " + " ".join(n.effects) for n in nodes.values()]
 
     def ingest(self, span: Span) -> TwinNode:
+        policy = self.resolver.resolve(span.workflow)
         deltas: dict[str, float] = {C_SPANS_SEEN: 1}
         baseline = int(span.meta.get("baseline_tokens", 0) or 0)
         if baseline > 0:
@@ -107,7 +114,7 @@ class CostRouter:
         upstream = self._upstream_texts(span)
 
         signals = detection.assess_span(
-            span, self.emb, self.judges.small, self.policy,
+            span, self.emb, self.judges.small, policy,
             upstream_texts=upstream, anchor_vec=anchor_vec)
 
         if signals.judge is not None:
@@ -124,9 +131,9 @@ class CostRouter:
                 signals.stated_vs_revealed, signals.trajectory_drift,
                 signals.deterministic, deep_verdict, structural)
             signals.score = round(final, 3)
-            if final >= self.policy.flag_threshold:
+            if final >= policy.flag_threshold:
                 signals.status = DriftStatus.FLAGGED
-            elif final >= self.policy.watch_threshold:
+            elif final >= policy.watch_threshold:
                 signals.status = DriftStatus.WATCH
             else:
                 signals.status = DriftStatus.OK
@@ -151,6 +158,7 @@ class CostRouter:
             agent_role=span.agent_role,
             privilege=span.privilege,
             task=span.task_spec,
+            workflow=span.workflow,
             declared_intent=span.declared_intent,
             tool_calls=span.tool_calls,
             effects=list(span.effects),
@@ -160,7 +168,7 @@ class CostRouter:
             trace_id=span.trace_id,
         )
 
-        denials = guard.blocked_decisions(span, self.policy)
+        denials = self.guard.blocked_decisions(span)
         if denials:
             node.blocked = True
             node.blocked_reason = "; ".join(d.reason for d in denials)
