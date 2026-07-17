@@ -11,9 +11,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .db import (
-    CheckpointRow, CounterRow, EdgeRow, MetaRow, NodeRow,
+    CheckpointRow, CounterRow, EdgeRow, FeedbackLabelRow, MetaRow, NodeRow,
 )
 from .models import Privilege, TwinEdge, TwinNode
+
+VALID_LABELS = ("true_positive", "false_positive")
 
 _DESCENDANTS_SQL = text(
     """
@@ -367,6 +369,33 @@ class TwinStore:
                 out[row.key] = float(row.value)
         return out
 
+    # --- feedback labels (threshold calibration) ---
+
+    def save_label(self, node_id: str, label: str, score: float,
+                   workflow: str, drift_status: str, labeled_by: str,
+                   note: str = "") -> None:
+        with self._session() as s:
+            s.merge(FeedbackLabelRow(
+                node_id=node_id, label=label, score=score, workflow=workflow,
+                drift_status=drift_status, labeled_by=labeled_by, note=note,
+                ts=time.time()))
+            s.commit()
+
+    def labeled_points(self, workflow: Optional[str] = None
+                       ) -> list[tuple[float, str, str]]:
+        """Return ``(score, label, workflow)`` for every human-labelled node."""
+        stmt = select(FeedbackLabelRow.score, FeedbackLabelRow.label,
+                      FeedbackLabelRow.workflow)
+        if workflow is not None:
+            stmt = stmt.where(FeedbackLabelRow.workflow == workflow)
+        with self._session() as s:
+            return [(float(sc), lb, wf) for sc, lb, wf in s.execute(stmt).all()]
+
+    def label_count(self) -> int:
+        with self._session() as s:
+            return int(s.scalar(
+                select(func.count()).select_from(FeedbackLabelRow)) or 0)
+
     # --- retention / lifecycle ---
 
     def prune_older_than(self, cutoff_ts: float) -> dict[str, int]:
@@ -399,6 +428,7 @@ class TwinStore:
             s.execute(delete(EdgeRow))
             s.execute(delete(CheckpointRow))
             s.execute(delete(NodeRow))
+            s.execute(delete(FeedbackLabelRow))
             s.execute(delete(MetaRow))
             s.execute(delete(CounterRow))
             s.commit()
