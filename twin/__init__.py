@@ -1,9 +1,11 @@
-"""Drift Containment & Remediation platform — the twin package.
+__version__ = "1.0.0"
 
-Public surface: `Engine` (facade) plus the models. See the module docstrings for
-how each piece maps to the builder brief sections.
-"""
-from .engine import Engine
 
-__all__ = ["Engine"]
-__version__ = "0.1.0"
+def __getattr__(name):
+    if name == "Engine":
+        from .engine import Engine
+        return Engine
+    raise AttributeError(name)
+
+
+__all__ = ["Engine", "__version__"]

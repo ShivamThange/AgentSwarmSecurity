@@ -1,58 +1,95 @@
-"""Engine — wires the twin, router, detection, remediation and audit into one
-facade the API and CLI drive. This is the detect -> attribute -> remediate ->
-redeploy loop of Section 12.4, running within the cost envelope.
-
-The twin (graph + checkpoints + audit chain + cost snapshot) is DURABLE: point the
-engine at a file path and it survives a process restart, which is the whole moat —
-cross-run, cross-time causal state (Section 8.1). `load_or_seed` reconstructs the
-derived incident view from the persisted graph without re-ingesting anything.
-"""
 from __future__ import annotations
 
-from . import attribution, guard, llm, scenario, whatif
-from .audit import AuditLog
-from .graph import TwinStore
-from .models import DriftStatus, Span, Tier
+import logging
+import time
+from typing import Optional
+
+from sqlalchemy import text
+
+from . import attribution, calibration, metrics, replay
+from .audit import AuditLog, load_compliance_map
+from .config import Settings, get_settings
+from .db import build_engine, build_session_factory, init_schema
+from .detection import DetectionPolicy, PolicyResolver
+from .embeddings import build_embedder
+from .escalation import EscalationMonitor
+from .guard import build_guard
+from .llm import build_judges
+from .models import DriftStatus, Span, Tier, TwinNode
 from .remediation import RemediationEngine
 from .router import CostRouter
+from .security import ApiKeyManager, RateLimiter
+from .store import VALID_LABELS, TwinStore
 
-_LEDGER_KEY = "cost_ledger"
+log = logging.getLogger(__name__)
 
 
 class Engine:
-    def __init__(self, db_path: str = ":memory:") -> None:
-        self.db_path = db_path
-        self.store = TwinStore(db_path)
-        self.audit = AuditLog(conn=self.store._conn)
-        # Hybrid judge: online LLM if configured via env, else offline StubJudge.
-        self.llm_config = llm.LLMConfig.from_env()
-        self.router = CostRouter(self.store, judge=llm.build_judge(self.llm_config))
-        self.remediation = RemediationEngine(self.store, self.audit)
-        self.incident_narrative = None  # cached CausalNarrative for the seeded run
-        self.boot_mode = "empty"        # "seeded" | "loaded" | "empty"
+    def __init__(self, settings: Optional[Settings] = None) -> None:
+        self.settings = settings or get_settings()
+        self.db_engine = build_engine(self.settings)
+        init_schema(self.db_engine)
+        self.session_factory = build_session_factory(self.db_engine)
 
-    # ------------------------------------------------------------------ #
+        self.store = TwinStore(self.db_engine, self.session_factory)
+        self.audit = AuditLog(
+            self.session_factory,
+            compliance_map=load_compliance_map(
+                self.settings.compliance_map_path))
+        self.policy = DetectionPolicy.from_settings(self.settings)
+        self.resolver = PolicyResolver(
+            self.policy, self.settings.threshold_profiles)
+        self.embedder = build_embedder(self.settings)
+        self.judges = build_judges(self.settings, self.policy)
+        self.guard = build_guard(self.settings, self.policy)
+        self.router = CostRouter(
+            self.store, self.embedder, self.judges, self.policy,
+            low_sample_rate=self.settings.low_privilege_sample_rate,
+            cache_size=self.settings.detection_cache_size,
+            guard=self.guard,
+            resolver=self.resolver,
+        )
+        self.remediation = RemediationEngine(
+            self.store, self.audit, self.session_factory)
+        self.keys = ApiKeyManager(self.session_factory)
+        self.rate_limiter = RateLimiter(self.settings.rate_limit_per_minute)
+        self.escalation = EscalationMonitor(
+            window_seconds=self.settings.escalation_window_seconds,
+            ratio_threshold=self.settings.escalation_ratio_threshold,
+            rate_threshold_per_min=(
+                self.settings.escalation_rate_threshold_per_min),
+            min_samples=self.settings.escalation_min_samples,
+        )
+        self.started_at = time.time()
+
     def close(self) -> None:
-        """Release the underlying database connection (Windows needs this before
-        the file can be removed)."""
-        self.store.close()
+        try:
+            self.db_engine.dispose()
+        except Exception:
+            pass
 
-    def reset(self) -> None:
-        self.store.reset()
-        self.audit.reset()
-        self.router.ledger.__init__()
-        self.router._cache.clear()
-        self.router._chain_anchor.clear()
-        self.remediation._actions.clear()
+    # --- ingestion ---
 
-    def ingest(self, span: Span, idempotent: bool = True):
-        # Idempotent on span id: replaying the same span never double-counts the
-        # cost ledger or duplicates a node (endpoint-hardening requirement).
+    def ingest(self, span: Span, idempotent: bool = True) -> TwinNode:
         if idempotent and self.store.has_node(span.span_id):
             return self.store.get_node(span.span_id)
         node = self.router.ingest(span)
         d = node.drift
+
+        metrics.SPANS_INGESTED.labels(status=d.status.value).inc()
+        metrics.TIER_DECISIONS.labels(tier=d.tier_reached.value).inc()
+
+        escalated = d.tier_reached in (Tier.SMALL_JUDGE, Tier.DEEP_ESCALATION)
+        esc = self.escalation.record(escalated)
+        metrics.ESCALATION_RATIO.set(esc["ratio"])
+        if esc["anomaly"]:
+            metrics.ESCALATION_ANOMALIES.inc()
+            self.audit.record(
+                "system", "escalation.anomaly", node.node_id,
+                detail="; ".join(esc["reasons"]))
+
         if node.blocked:
+            metrics.BLOCKED_ACTIONS.inc()
             self.audit.record("inline-rail", "action.blocked", node.node_id,
                               detail=node.blocked_reason)
         if d.tier_reached in (Tier.SMALL_JUDGE, Tier.DEEP_ESCALATION):
@@ -63,106 +100,150 @@ class Engine:
             self.audit.record("system", "detection", node.node_id,
                               detail=f"{d.status.value} score={d.score:.2f} "
                                      f"risk={d.risk_type}: {d.rationale}")
+        if d.status == DriftStatus.FLAGGED:
+            metrics.DRIFT_FLAGGED.labels(
+                risk_type=d.risk_type or "unclassified").inc()
+            self._auto_propose(node)
         return node
 
-    def seed(self, background: int = 200) -> None:
-        """Reset and replay the beachhead scenario through the full pipeline,
-        against a realistic volume of clean org-wide background traffic."""
-        self.reset()
-        # background load first, so the incident lands into an already-busy twin
-        for span in scenario.background_spans(background):
-            self.ingest(span)
-        for span in scenario.build_spans():
-            self.ingest(span)
-        # attribute the incident once and register its proposed remediation so the
-        # supervisor can approve/reject concrete actions.
-        self.incident_narrative = attribution.build_narrative(self.store)
-        if self.incident_narrative:
-            self.remediation.register(self.incident_narrative.recommended_remediation)
-        # persist the cost snapshot so a reloaded twin shows the same figures
-        self.store.set_meta(_LEDGER_KEY, self.router.ledger.as_dict())
-        self.boot_mode = "seeded"
+    def _auto_propose(self, node: TwinNode) -> None:
+        try:
+            root_id = attribution.find_root_cause(
+                self.store, node.node_id, self.policy)
+            root = self.store.get_node(root_id)
+            if root is None:
+                return
+            actions = attribution.propose_remediation(self.store, root)
+            registered = self.remediation.register(actions)
+            for _ in registered:
+                metrics.REMEDIATION_EVENTS.labels(event="proposed").inc()
+        except Exception:
+            log.exception("auto-propose remediation failed for %s",
+                          node.node_id)
 
-    def load_or_seed(self, background: int = 200) -> str:
-        """If the persisted twin already has data, reconstruct the derived view
-        from it (proving cross-restart persistence). Otherwise seed fresh."""
-        if self.store.all_nodes():
-            self._rebuild_from_store()
-            self.boot_mode = "loaded"
-        else:
-            self.seed(background=background)
-        return self.boot_mode
+    # --- analysis ---
 
-    def _rebuild_from_store(self) -> None:
-        """Rebuild in-memory derived state (narrative, proposed remediation, cost
-        ledger) from the persisted graph WITHOUT re-ingesting any span."""
-        snap = self.store.get_meta(_LEDGER_KEY)
-        if snap:
-            self.router.ledger.load_dict(snap)
-        self.incident_narrative = attribution.build_narrative(self.store)
-        if self.incident_narrative and not self.remediation.all_actions():
-            self.remediation.register(self.incident_narrative.recommended_remediation)
+    def narrative(self, target_id: Optional[str] = None):
+        return attribution.build_narrative(self.store, target_id, self.policy)
 
-    # ------------------------------------------------------------------ #
-    def narrative(self, target_id: str | None = None):
-        return attribution.build_narrative(self.store, target_id)
+    def incidents(self, limit: int = 50, offset: int = 0):
+        return attribution.list_incidents(self.store, self.policy,
+                                          limit=limit, offset=offset)
 
     def whatif(self, root_id: str):
-        return whatif.build_preview(self.store, root_id)
+        return replay.build_preview(self.store, root_id, self.embedder,
+                                    self.policy)
 
-    def graph_state(self, trace: str | None = None) -> dict:
-        """Graph view. `trace` focuses on one incident (default: the whole twin).
-        Background traffic lives in the twin but is filtered out of the focused
-        incident view."""
-        nodes = self.store.all_nodes()
-        if trace:
-            nodes = [n for n in nodes if n.trace_id == trace]
-        node_ids = {n.node_id for n in nodes}
-        edges = [e for e in self.store.all_edges()
-                 if e.src in node_ids and e.dst in node_ids]
+    def graph_state(self, trace_id: str) -> dict:
+        nodes, total = self.store.list_nodes(trace_id=trace_id, limit=2000)
+        node_ids = [n.node_id for n in nodes]
+        edges = self.store.edges_for_nodes(node_ids)
         return {
             "nodes": [n.model_dump(mode="json") for n in nodes],
             "edges": [e.model_dump(mode="json") for e in edges],
-            "total_nodes_in_twin": len(self.store.all_nodes()),
-            "focused_trace": trace,
+            "trace_id": trace_id,
+            "node_count": total,
         }
 
-    def cost(self) -> dict:
-        return self.router.ledger.as_dict()
-
-    def compliance(self) -> dict:
-        return self.audit.compliance_report()
-
-    def guard_report(self) -> dict:
-        """Inline-rail decisions across the twin: what was stopped pre-execution."""
-        blocked = [n for n in self.store.all_nodes() if n.blocked]
+    def guard_report(self, limit: int = 100, offset: int = 0) -> dict:
+        blocked, total = self.store.list_nodes(blocked=True, limit=limit,
+                                               offset=offset)
         return {
-            "blocked_count": len(blocked),
+            "blocked_count": total,
             "blocked": [
                 {"node_id": n.node_id, "agent_id": n.agent_id,
+                 "trace_id": n.trace_id,
                  "tool_calls": [c.name for c in n.tool_calls],
                  "reason": n.blocked_reason}
                 for n in blocked
             ],
         }
 
-    def llm_info(self) -> dict:
-        """Which judge backs the escalation tier (online LLM vs offline stub)."""
-        return self.llm_config.info()
+    def cost(self) -> dict:
+        return self.router.ledger()
 
-    def persistence_info(self) -> dict:
-        """Evidence that the twin is durable, not just backed by code that could
-        be. Includes a live blast-radius read off the (possibly reloaded) graph."""
-        root = self.incident_narrative.root_cause_node if self.incident_narrative else None
-        return {
-            "db_path": self.db_path,
-            "durable": self.db_path != ":memory:",
-            "boot_mode": self.boot_mode,   # "seeded" on first boot, "loaded" after
-            "nodes_in_twin": len(self.store.all_nodes()),
-            "audit_entries": len(self.audit.entries()),
-            "audit_chain_valid": self.audit.verify_chain(),
-            "sample_query": {
-                "root_cause": root,
-                "blast_radius": sorted(self.store.blast_radius(root)) if root else [],
-            },
+    def escalation_report(self) -> dict:
+        return self.escalation.snapshot()
+
+    def compliance(self) -> dict:
+        return self.audit.compliance_report()
+
+    # --- calibration feedback loop ---
+
+    def label_node(self, node_id: str, label: str, actor: str,
+                   note: str = "") -> dict:
+        if label not in VALID_LABELS:
+            raise ValueError(
+                f"label must be one of {list(VALID_LABELS)}")
+        node = self.store.get_node(node_id)
+        if node is None:
+            raise KeyError(node_id)
+        self.store.save_label(
+            node_id=node_id, label=label, score=node.drift.score,
+            workflow=node.workflow, drift_status=node.drift.status.value,
+            labeled_by=actor, note=note)
+        self.audit.record(actor, "feedback.label", node_id,
+                          detail=f"{label} (score={node.drift.score:.2f}, "
+                                 f"workflow={node.workflow or '(default)'})")
+        return {"node_id": node_id, "label": label,
+                "score": node.drift.score, "workflow": node.workflow}
+
+    def calibration_report(self,
+                           target_precision: Optional[float] = None) -> dict:
+        points = self.store.labeled_points()
+        profile_threshold = {
+            wf: self.resolver.resolve(wf).flag_threshold
+            for wf in self.resolver.known_profiles()
         }
+        report = calibration.calibrate(
+            points, self.policy.flag_threshold,
+            profile_threshold=profile_threshold,
+            target_precision=target_precision)
+        report["configured_profiles"] = self.resolver.known_profiles()
+        return report
+
+    # --- ops ---
+
+    def db_ok(self) -> bool:
+        try:
+            with self.session_factory() as s:
+                s.execute(text("SELECT 1"))
+            return True
+        except Exception:
+            return False
+
+    def info(self) -> dict:
+        return {
+            "version": "1.0.0",
+            "uptime_seconds": round(time.time() - self.started_at, 1),
+            "database": {
+                "dialect": self.db_engine.dialect.name,
+                "ok": self.db_ok(),
+            },
+            "nodes_in_twin": self.store.node_count(),
+            "audit_entries": self.audit.count(),
+            "auth_enabled": self.settings.auth_enabled,
+            "embeddings": self.embedder.info(),
+            "judge": self.judges.info(),
+            "guard": self.guard.info(),
+            "policy": {
+                "flag_threshold": self.policy.flag_threshold,
+                "watch_threshold": self.policy.watch_threshold,
+                "hard_flag_severity": self.policy.hard_flag_severity,
+                "low_privilege_sample_rate":
+                    self.settings.low_privilege_sample_rate,
+                "dangerous_tools": sorted(self.policy.dangerous_tools),
+                "threshold_profiles": self.resolver.known_profiles(),
+            },
+            "feedback_labels": self.store.label_count(),
+        }
+
+    def run_retention(self, days: int, actor: str = "system") -> dict:
+        cutoff = time.time() - days * 86400.0
+        result = self.store.prune_older_than(cutoff)
+        self.audit.record(actor, "retention.pruned", "twin",
+                          detail=f"removed {result['nodes']} node(s), "
+                                 f"{result['edges']} edge(s), "
+                                 f"{result['checkpoints']} checkpoint(s) "
+                                 f"older than {days}d")
+        return result

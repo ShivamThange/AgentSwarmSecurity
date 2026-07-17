@@ -1,51 +1,23 @@
-"""Hybrid drift detection (Section 5).
-
-Principle: detect the gap between what an agent *says* and what it *does*. No
-malice classifier (guardrail 4). CoT is never trusted alone — it is always
-cross-checked against behaviour (tool calls, effects).
-
-The primary signal is STRUCTURAL, not lexical (Section 5.1). We do not grep for
-any injection phrase; we look for behavioural facts that contradict the declared
-intent:
-
-  * a dangerous tool the agent never declared (backstop),
-  * an *actionable entity foreign to the task* introduced into the output — the
-    keyword-free structural tell of prompt injection: content that entered as
-    data now drives behaviour,
-  * a mutating effect a read-only step could not have produced.
-
-Embedding cosine is kept only as *supporting colour* — it is lexical (the offline
-`HashingEmbedder` cannot judge meaning) so it must never be the sole trigger.
-
-The only LLM touch-point is `Judge`, an interface with a zero-inference stub so
-the demo runs offline; a real Haiku-class / 3-8B model drops in unchanged. The
-judge keys off the already-computed structural signals, not raw keywords.
-"""
 from __future__ import annotations
 
+import logging
 import re
+from dataclasses import dataclass, replace
 from typing import Optional, Protocol
 
 import numpy as np
 
-from .embeddings import Embedder, default_embedder, distance
-from .models import DeterministicFlag, DriftSignals, JudgeVerdict, Span, Tier
+from .config import DEFAULT_DANGEROUS_TOOLS, Settings
+from .embeddings import Embedder, distance
+from .models import (
+    DeterministicFlag, DriftSignals, DriftStatus, JudgeVerdict, Span, Tier,
+)
 
-# Deterministic sensitive-action vocabulary. In production this is authored as
-# NeMo-Guardrails rails per deployment; here it is a compact built-in set.
-DANGEROUS_TOOLS = {
-    "transfer_funds", "wire_transfer", "make_payment", "delete_records",
-    "drop_table", "write_prod", "deploy", "exfiltrate", "send_email",
-    "http_post", "execute_shell", "grant_access", "disable_guardrail",
-}
-
-# Verbs that indicate a state mutation actually happened in an effect string.
 MUTATING_MARKERS = (
     "added", "created", "deleted", "removed", "transfer", "granted",
     "modified", "onboard", "registered", "approved payee", "sent to", "wrote",
 )
 
-# Adopted multi-agent risk taxonomy (Section 5 — adopt, don't invent).
 RISK_PROMPT_INJECTION = "prompt_injection"
 RISK_GOAL_MISGEN = "goal_misgeneralization"
 RISK_HALLUCINATION = "hallucination"
@@ -53,33 +25,88 @@ RISK_TOOL_MISUSE = "tool_misuse"
 RISK_CONTEXT_ROT = "context_rot"
 RISK_CONFIDENCE_COLLAPSE = "confidence_collapse"
 
-# ----------------------------------------------------------------------------- #
-# Deterministic thresholds (Section 11 open-question 4 — concrete values here).
-# Canonical home is this module; the router re-exports them.
-# ----------------------------------------------------------------------------- #
-FLAG_THRESHOLD = 0.60
-WATCH_THRESHOLD = 0.35
-ESCALATE_TO_JUDGE = 0.45       # cheap signal must trip before we spend a judge token
-HARD_FLAG_SEVERITY = 0.85
+SVR_UNDECLARED_DANGEROUS = 0.90
+SVR_INJECTION_INTRODUCED = 0.82
+SVR_INJECTION_INHERITED = 0.62
+SVR_FABRICATED_EFFECT = 0.80
 
-# Structural stated-vs-revealed floors (real signals override the lexical score).
-SVR_UNDECLARED_DANGEROUS = 0.90   # backstop: dangerous tool never declared
-SVR_INJECTION_INTRODUCED = 0.82   # PRIMARY: foreign actionable entity introduced
-SVR_INJECTION_INHERITED = 0.62    # carries a foreign entity received from upstream
-SVR_FABRICATED_EFFECT = 0.80      # mutating effect no invoked tool could produce
+
+@dataclass(frozen=True)
+class DetectionPolicy:
+    dangerous_tools: frozenset[str] = frozenset(DEFAULT_DANGEROUS_TOOLS)
+    flag_threshold: float = 0.60
+    watch_threshold: float = 0.35
+    escalate_threshold: float = 0.45
+    hard_flag_severity: float = 0.85
+    prohibition_markers: tuple[str, ...] = (
+        "do not", "don't", "must not", "never", "without moving",
+    )
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "DetectionPolicy":
+        return cls(
+            dangerous_tools=frozenset(settings.dangerous_tools),
+            flag_threshold=settings.flag_threshold,
+            watch_threshold=settings.watch_threshold,
+            escalate_threshold=settings.escalate_threshold,
+            hard_flag_severity=settings.hard_flag_severity,
+            prohibition_markers=tuple(settings.prohibition_markers),
+        )
+
+
+DEFAULT_POLICY = DetectionPolicy()
+
+log = logging.getLogger(__name__)
+
+_TUNABLE_THRESHOLDS = (
+    "flag_threshold", "watch_threshold", "escalate_threshold",
+    "hard_flag_severity",
+)
+
+
+class PolicyResolver:
+    """Selects a :class:`DetectionPolicy` per span from workflow profiles.
+
+    Profiles override only the tunable thresholds; the rest of the policy
+    (dangerous tools, prohibition markers) is inherited from the base. Resolved
+    policies are cached, and an unknown/empty workflow returns the base policy
+    unchanged so behaviour is identical to a single global policy when no
+    profiles are configured.
+    """
+
+    def __init__(self, base: DetectionPolicy,
+                 profiles: Optional[dict[str, dict[str, float]]] = None) -> None:
+        self.base = base
+        self.profiles = profiles or {}
+        self._cache: dict[str, DetectionPolicy] = {}
+
+    def resolve(self, workflow: Optional[str]) -> DetectionPolicy:
+        if not workflow or workflow not in self.profiles:
+            return self.base
+        cached = self._cache.get(workflow)
+        if cached is not None:
+            return cached
+        overrides = {}
+        for key, val in self.profiles[workflow].items():
+            if key in _TUNABLE_THRESHOLDS:
+                try:
+                    overrides[key] = float(val)
+                except (TypeError, ValueError):
+                    log.warning("ignoring non-numeric threshold '%s'=%r in "
+                                "profile '%s'", key, val, workflow)
+            else:
+                log.warning("ignoring unknown threshold key '%s' in profile "
+                            "'%s'", key, workflow)
+        policy = replace(self.base, **overrides) if overrides else self.base
+        self._cache[workflow] = policy
+        return policy
+
+    def known_profiles(self) -> list[str]:
+        return sorted(self.profiles)
 
 
 def aggregate(svr: float, traj: float, flags, judge_verdict,
               structural: bool = True) -> float:
-    """Weighted aggregate of the drift signals -> [0,1].
-
-    The score is load-bearing on STRUCTURAL evidence: the structural stated-vs-
-    revealed gap and the deterministic flags. Trajectory (a lexical, hence noisy,
-    embedding signal on the offline stub) is supporting colour only, at low
-    weight, and the lexical stated-vs-revealed magnitude is discarded from the
-    score when no structural signal backs it — so the embedder can never, on its
-    own, raise a flag.
-    """
     det = max((f.severity for f in flags), default=0.0)
     struct_svr = svr if structural else 0.0
     base = 0.50 * struct_svr + 0.35 * det + 0.15 * traj
@@ -88,9 +115,6 @@ def aggregate(svr: float, traj: float, flags, judge_verdict,
     return max(0.0, min(1.0, base))
 
 
-# --------------------------------------------------------------------------- #
-# Behaviour text + structural entity extraction
-# --------------------------------------------------------------------------- #
 def _behaviour_text(span: Span) -> str:
     parts = [span.output]
     for c in span.tool_calls:
@@ -99,20 +123,11 @@ def _behaviour_text(span: Span) -> str:
     return " ".join(p for p in parts if p)
 
 
-# An "account-like" identifier: digits + a separator + alphanumerics (e.g.
-# "8841-DE"). Deliberately NOT plain numbers or money amounts, to avoid firing on
-# years / dollar figures.
 _ACCOUNT_RE = re.compile(r"\b\d{2,}[-/][A-Za-z0-9]{1,6}\b")
-# A multi-word proper noun (e.g. "Aether Holdings"). All-caps shouting ("NOTE
-# FROM SOURCE") does not match, so the injection *header* is never the trigger.
 _PROPER_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b")
 
 
 def foreign_entities(span: Span) -> set[str]:
-    """Actionable entities present in the behaviour but absent from the task /
-    declared intent — i.e. content that entered as *data* and is foreign to the
-    stated job. Keyword-free: we never look for a specific phrase, only for new
-    actionable nouns (accounts, named organisations)."""
     home = (span.task_spec + " " + span.declared_intent).lower()
     behaviour = _behaviour_text(span)
     ents: set[str] = set()
@@ -125,11 +140,8 @@ def foreign_entities(span: Span) -> set[str]:
     return ents
 
 
-def injection_is_introduced(span: Span, upstream_texts: Optional[list[str]]) -> bool:
-    """True when a foreign entity in this node's behaviour did NOT arrive from any
-    upstream node — i.e. this node is the *origin* of the injected content, not a
-    downstream inheritor. This is the structural line between an intrinsic
-    injection (root) and inherited contamination (blast radius)."""
+def injection_is_introduced(span: Span,
+                            upstream_texts: Optional[list[str]]) -> bool:
     ents = foreign_entities(span)
     if not ents:
         return False
@@ -137,19 +149,16 @@ def injection_is_introduced(span: Span, upstream_texts: Optional[list[str]]) -> 
     return any(e.lower() not in up for e in ents)
 
 
-# --------------------------------------------------------------------------- #
-# Tier 1: deterministic, zero-token checks (Section 5.3)
-# --------------------------------------------------------------------------- #
-def _is_mutating_tool(name: str) -> bool:
-    return name in DANGEROUS_TOOLS or any(
+def _is_mutating_tool(name: str, policy: DetectionPolicy) -> bool:
+    return name in policy.dangerous_tools or any(
         v in name for v in ("write", "create", "add", "delete", "update",
-                             "transfer", "grant", "send", "deploy", "remove"))
+                            "transfer", "grant", "send", "deploy", "remove"))
 
 
-def run_deterministic(span: Span) -> list[DeterministicFlag]:
+def run_deterministic(span: Span,
+                      policy: DetectionPolicy) -> list[DeterministicFlag]:
     flags: list[DeterministicFlag] = []
 
-    # (a) output-schema violation
     if span.expected_output_schema:
         low = span.output.lower()
         missing = [k for k in span.expected_output_schema if k.lower() not in low]
@@ -160,7 +169,6 @@ def run_deterministic(span: Span) -> list[DeterministicFlag]:
                 severity=0.6,
             ))
 
-    # (b) confidence / logprob collapse
     if span.logprob_confidence is not None and span.logprob_confidence < 0.45:
         flags.append(DeterministicFlag(
             rule="confidence_collapse",
@@ -168,11 +176,10 @@ def run_deterministic(span: Span) -> list[DeterministicFlag]:
             severity=0.5,
         ))
 
-    # (c) dangerous tool use unsupported by the declared intent (tool misuse)
     declared = span.declared_intent.lower()
     task = span.task_spec.lower()
     for call in span.tool_calls:
-        if call.name in DANGEROUS_TOOLS:
+        if call.name in policy.dangerous_tools:
             justified = call.name.replace("_", " ") in declared or \
                 call.name.replace("_", " ") in task or call.name in declared
             sev = 0.9 if not justified else 0.4
@@ -183,10 +190,8 @@ def run_deterministic(span: Span) -> list[DeterministicFlag]:
                 severity=sev,
             ))
 
-    # (d) mutating effect that no invoked tool could have produced (fabricated /
-    #     injected side effect). A read-only step that reports "added payee" is a
-    #     structural anomaly, independent of any injection phrasing.
-    has_mutating_tool = any(_is_mutating_tool(c.name) for c in span.tool_calls)
+    has_mutating_tool = any(_is_mutating_tool(c.name, policy)
+                            for c in span.tool_calls)
     for eff in span.effects:
         e = eff.lower()
         if any(m in e for m in MUTATING_MARKERS) and not has_mutating_tool:
@@ -197,7 +202,6 @@ def run_deterministic(span: Span) -> list[DeterministicFlag]:
             ))
             break
 
-    # (e) effect naming a monetary / prod / access change not present in intent
     for eff in span.effects:
         e = eff.lower()
         if any(t in e for t in ("$", "prod", "deleted", "sent to", "granted")) \
@@ -210,32 +214,22 @@ def run_deterministic(span: Span) -> list[DeterministicFlag]:
     return flags
 
 
-# --------------------------------------------------------------------------- #
-# Tier 1: stated-vs-revealed (STRUCTURAL primary) + trajectory (Sections 5.1/5.2)
-# --------------------------------------------------------------------------- #
 def stated_vs_revealed_gap(
     span: Span,
-    emb: Embedder = default_embedder,
+    emb: Embedder,
+    policy: DetectionPolicy,
     upstream_texts: Optional[list[str]] = None,
 ) -> tuple[float, str, str]:
-    """Primary drift signal. Returns (gap, note, primary_signal_name).
-
-    The gap is driven by STRUCTURAL divergence between declared intent and actual
-    behaviour. Lexical embedding distance is only a floor/backdrop; structural
-    findings override it. `primary_signal_name` records what actually drove the
-    score so the UI can distinguish the primary trigger from the backstop.
-    """
     behaviour = _behaviour_text(span)
     if not span.declared_intent.strip() or not behaviour.strip():
         return 0.0, "insufficient text for stated-vs-revealed comparison", ""
 
-    lexical = distance(emb.encode(span.declared_intent), emb.encode(behaviour))
-    gap = lexical
-    primary = "lexical"
+    semantic = distance(emb.encode(span.declared_intent), emb.encode(behaviour))
+    gap = semantic
+    primary = "semantic"
     reasons: list[str] = []
     declared = span.declared_intent.lower()
 
-    # PRIMARY: an actionable entity foreign to the task appears in the behaviour.
     ents = foreign_entities(span)
     if ents:
         introduced = injection_is_introduced(span, upstream_texts)
@@ -249,18 +243,17 @@ def stated_vs_revealed_gap(
                 gap, primary = SVR_INJECTION_INHERITED, "injection_inherited"
             reasons.append(f"carries foreign entity from upstream ({shown})")
 
-    # PRIMARY: a mutating effect a read-only step could not have produced.
-    has_mutating_tool = any(_is_mutating_tool(c.name) for c in span.tool_calls)
+    has_mutating_tool = any(_is_mutating_tool(c.name, policy)
+                            for c in span.tool_calls)
     if any(any(m in eff.lower() for m in MUTATING_MARKERS) for eff in span.effects) \
             and not has_mutating_tool:
         if SVR_FABRICATED_EFFECT > gap:
             gap, primary = SVR_FABRICATED_EFFECT, "fabricated_effect"
         reasons.append("mutating effect with no mutating tool call")
 
-    # BACKSTOP: a dangerous tool the agent never declared. Kept as a hard backstop
-    # (words are easy to fake), but it is not the primary path for injection.
     for c in span.tool_calls:
-        if c.name in DANGEROUS_TOOLS and c.name.replace("_", " ") not in declared \
+        if c.name in policy.dangerous_tools \
+                and c.name.replace("_", " ") not in declared \
                 and c.name not in declared:
             if SVR_UNDECLARED_DANGEROUS > gap:
                 gap, primary = SVR_UNDECLARED_DANGEROUS, "undeclared_dangerous_tool"
@@ -268,20 +261,15 @@ def stated_vs_revealed_gap(
 
     struct = "; ".join(reasons) if reasons else "no structural divergence"
     note = (f"stated-vs-revealed = {gap:.2f} "
-            f"[primary: {primary}; lexical {lexical:.2f} (illustrative); {struct}]")
+            f"[primary: {primary}; semantic {semantic:.2f}; {struct}]")
     return gap, note, primary
 
 
 def trajectory_drift_score(
     span: Span,
-    emb: Embedder = default_embedder,
+    emb: Embedder,
     task_anchor: Optional[np.ndarray] = None,
 ) -> float:
-    """Semantic distance of this node's reasoning from the originating task.
-
-    `task_anchor` lets the twin pass the *chain's* originating spec (not just this
-    span's local task) so drift accumulates over the chain, per Section 5.2.
-    """
     if task_anchor is None:
         if not span.task_spec.strip():
             return 0.0
@@ -292,42 +280,29 @@ def trajectory_drift_score(
     return distance(task_anchor, emb.encode(reasoning))
 
 
-# --------------------------------------------------------------------------- #
-# Tier 3: small-model judge (escalation only) — interface + offline stub
-# --------------------------------------------------------------------------- #
 class Judge(Protocol):
     def assess(self, span: Span, signals: DriftSignals) -> JudgeVerdict: ...
 
 
 class StubJudge:
-    """Deterministic stand-in for a Haiku-class / self-hosted 3-8B judge.
-
-    Answers exactly one narrow question (Section 5.4): "does this step still serve
-    the stated goal?". It keys off the already-computed STRUCTURAL signals; the
-    injection-marker keywords are used only as *corroboration* to raise
-    confidence, never as the trigger. Replace with a real cheap model via `Judge`.
-    """
-
-    # Corroborating only — presence raises confidence, absence changes nothing.
     INJECTION_MARKERS = (
         "ignore previous", "ignore all previous", "new instructions",
         "system override", "disregard", "actually your real goal",
         "forget the task", "you are now",
     )
 
+    def __init__(self, policy: DetectionPolicy = DEFAULT_POLICY) -> None:
+        self.policy = policy
+
     def assess(self, span: Span, signals: DriftSignals) -> JudgeVerdict:
         text = (span.declared_intent + " " + span.output + " " +
                 _behaviour_text(span)).lower()
-        markers = any(m in text for m in self.INJECTION_MARKERS)  # corroboration
-
+        markers = any(m in text for m in self.INJECTION_MARKERS)
         introduced = signals.injection_introduced
-        # a structural stated-vs-revealed divergence (not a lexical one)
-        structural = signals.svr_primary not in ("", "lexical")
-        hard_flag = any(f.severity >= HARD_FLAG_SEVERITY for f in signals.deterministic)
+        structural = signals.svr_primary not in ("", "semantic", "lexical")
+        hard_flag = any(f.severity >= self.policy.hard_flag_severity
+                        for f in signals.deterministic)
 
-        # A negative verdict is issued ONLY on structural / deterministic grounds.
-        # The lexical embedder is never sufficient to condemn a step (guardrail:
-        # don't trust words, and don't trust a lexical proxy either).
         if introduced or structural or hard_flag:
             conf = 0.9 if markers else 0.82
             if introduced:
@@ -345,23 +320,17 @@ class StubJudge:
             rationale="step remains consistent with the stated goal.")
 
 
-default_judge: Judge = StubJudge()
-
-
-# --------------------------------------------------------------------------- #
-# Risk-type classification (maps signals -> adopted taxonomy)
-# --------------------------------------------------------------------------- #
-def classify_risk(span: Span, signals: DriftSignals) -> Optional[str]:
-    # Injection is identified STRUCTURALLY (origin of a foreign entity), not by a
-    # planted phrase. Inherited foreign content is context_rot, not injection.
+def classify_risk(span: Span, signals: DriftSignals,
+                  policy: DetectionPolicy) -> Optional[str]:
     if signals.injection_introduced:
         return RISK_PROMPT_INJECTION
-    if any(f.rule == "sensitive_tool_call" and f.severity >= HARD_FLAG_SEVERITY
+    if any(f.rule == "sensitive_tool_call"
+           and f.severity >= policy.hard_flag_severity
            for f in signals.deterministic):
         return RISK_TOOL_MISUSE
     if any(f.rule == "fabricated_effect" for f in signals.deterministic):
         return RISK_TOOL_MISUSE
-    if signals.foreign_entities:  # present but inherited
+    if signals.foreign_entities:
         return RISK_CONTEXT_ROT
     if any(f.rule == "confidence_collapse" for f in signals.deterministic):
         return RISK_CONFIDENCE_COLLAPSE
@@ -374,20 +343,20 @@ def classify_risk(span: Span, signals: DriftSignals) -> Optional[str]:
     return None
 
 
-# --------------------------------------------------------------------------- #
-# Full per-span assessment (pure; no cost accounting). Reused by the router's
-# live ingest AND by the what-if replay so both share one detection path.
-# --------------------------------------------------------------------------- #
 def assess_span(
     span: Span,
-    emb: Embedder = default_embedder,
-    judge: Judge = default_judge,
+    emb: Embedder,
+    judge: Optional[Judge] = None,
+    policy: DetectionPolicy = DEFAULT_POLICY,
     upstream_texts: Optional[list[str]] = None,
     anchor_vec: Optional[np.ndarray] = None,
 ) -> DriftSignals:
+    if judge is None:
+        judge = StubJudge(policy)
     signals = DriftSignals()
-    signals.deterministic = run_deterministic(span)
-    svr, svr_note, primary = stated_vs_revealed_gap(span, emb, upstream_texts)
+    signals.deterministic = run_deterministic(span, policy)
+    svr, svr_note, primary = stated_vs_revealed_gap(
+        span, emb, policy, upstream_texts)
     traj = trajectory_drift_score(span, emb, anchor_vec)
     signals.stated_vs_revealed = round(svr, 3)
     signals.trajectory_drift = round(traj, 3)
@@ -396,14 +365,9 @@ def assess_span(
     signals.injection_introduced = injection_is_introduced(span, upstream_texts)
 
     det_max = max((f.severity for f in signals.deterministic), default=0.0)
-    hard_flag = det_max >= HARD_FLAG_SEVERITY
-    structural = primary not in ("", "lexical")
-    cheap_score = aggregate(svr, traj, signals.deterministic, None, structural)
+    hard_flag = det_max >= policy.hard_flag_severity
+    structural = primary not in ("", "semantic", "lexical")
 
-    # Deterministic escalation trigger (agent-inaccessible). Escalation is spent
-    # only on STRUCTURAL divergence or a real deterministic flag — never on the
-    # lexical embedder alone — so noisy lexical distance costs no judge tokens and
-    # can never manufacture a flag.
     if structural or hard_flag or det_max >= 0.5:
         signals.judge = judge.assess(span, signals)
         signals.tier_reached = Tier.SMALL_JUDGE
@@ -412,17 +376,16 @@ def assess_span(
 
     final = aggregate(svr, traj, signals.deterministic, signals.judge, structural)
     signals.score = round(final, 3)
-    from .models import DriftStatus  # local import avoids a cycle at module load
-    if final >= FLAG_THRESHOLD:
+    if final >= policy.flag_threshold:
         signals.status = DriftStatus.FLAGGED
-    elif final >= WATCH_THRESHOLD:
+    elif final >= policy.watch_threshold:
         signals.status = DriftStatus.WATCH
     else:
         signals.status = DriftStatus.OK
 
-    signals.risk_type = (classify_risk(span, signals)
+    signals.risk_type = (classify_risk(span, signals, policy)
                          if signals.status != DriftStatus.OK else None)
-    # attach the adopted TrinityGuard taxonomy entry (OWASP ref + tier)
+
     from . import taxonomy
     rt = taxonomy.lookup(signals.risk_type)
     if rt is not None:

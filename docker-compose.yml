@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: twin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: twin
+    volumes:
+      - twin-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U twin -d twin"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  twin:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TWIN_DATABASE_URL: postgresql+psycopg://twin:${POSTGRES_PASSWORD}@db:5432/twin
+      TWIN_AUTH_ENABLED: "true"
+      TWIN_BOOTSTRAP_ADMIN_KEY: ${TWIN_BOOTSTRAP_ADMIN_KEY:-}
+      TWIN_EMBEDDINGS_BACKEND: ${TWIN_EMBEDDINGS_BACKEND:-sentence-transformers}
+      TWIN_LLM_API_KEY: ${TWIN_LLM_API_KEY:-}
+      TWIN_LLM_BASE_URL: ${TWIN_LLM_BASE_URL:-}
+      TWIN_LLM_MODEL: ${TWIN_LLM_MODEL:-gpt-4o-mini}
+      TWIN_LLM_MODEL_DEEP: ${TWIN_LLM_MODEL_DEEP:-}
+      TWIN_LOG_JSON: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - twin-hf-cache:/home/twin/.cache/huggingface
+    restart: unless-stopped
+
+volumes:
+  twin-pgdata:
+  twin-hf-cache:

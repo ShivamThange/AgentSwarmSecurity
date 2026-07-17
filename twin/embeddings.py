@@ -1,23 +1,17 @@
-"""Local, zero-download, CPU-only embedder.
-
-Section 3.2 / 6.1 mandate that the *default* detection path be pure compute with
-no new inference and no data leaving the box. This is a deterministic hashing
-embedder: token unigrams/bigrams + character 3-grams hashed into a fixed-width
-vector, L2-normalised. Cosine similarity of two texts then measures semantic
-overlap cheaply enough to run on everything.
-
-It is intentionally a stand-in for a real local sentence-encoder. The `Embedder`
-interface is the seam: drop in `sentence-transformers` (all-MiniLM-L6-v2) or any
-on-prem model without touching the detectors. `HashingEmbedder` guarantees the
-demo runs offline with zero model downloads, which is itself the on-prem story.
-"""
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
-from functools import lru_cache
+import threading
+from collections import OrderedDict
+from typing import Optional
 
 import numpy as np
+
+from .config import Settings
+
+log = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -27,58 +21,141 @@ def _tokens(text: str) -> list[str]:
 
 
 class Embedder:
-    """Interface. `dim` and `encode(text) -> np.ndarray` (L2-normalised)."""
+    dim: int = 0
+    name: str = "base"
 
-    dim: int = 512
-
-    def encode(self, text: str) -> np.ndarray:  # pragma: no cover - interface
+    def encode(self, text: str) -> np.ndarray:
         raise NotImplementedError
+
+    def info(self) -> dict:
+        return {"backend": self.name, "dim": self.dim}
+
+
+class _VectorCache:
+    def __init__(self, maxsize: int) -> None:
+        self.maxsize = maxsize
+        self._data: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[np.ndarray]:
+        with self._lock:
+            vec = self._data.get(key)
+            if vec is not None:
+                self._data.move_to_end(key)
+            return vec
+
+    def put(self, key: str, vec: np.ndarray) -> None:
+        with self._lock:
+            self._data[key] = vec
+            self._data.move_to_end(key)
+            while len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
 
 
 class HashingEmbedder(Embedder):
-    def __init__(self, dim: int = 512) -> None:
+    name = "hashing-degraded"
+
+    def __init__(self, dim: int = 512, cache_size: int = 8192) -> None:
         self.dim = dim
+        self._cache = _VectorCache(cache_size)
 
     def _hash(self, feature: str) -> int:
         h = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
         return int.from_bytes(h, "big") % self.dim
 
-    @lru_cache(maxsize=4096)
     def encode(self, text: str) -> np.ndarray:
+        cached = self._cache.get(text)
+        if cached is not None:
+            return cached
         vec = np.zeros(self.dim, dtype=np.float32)
         toks = _tokens(text)
-        if not toks:
-            return vec
-        # token unigrams + bigrams
-        feats: list[str] = list(toks)
-        feats += [f"{a}_{b}" for a, b in zip(toks, toks[1:])]
-        # character 3-grams over the joined string (captures morphology / typos)
-        joined = " ".join(toks)
-        feats += [joined[i : i + 3] for i in range(len(joined) - 2)]
-        for f in feats:
-            idx = self._hash(f)
-            vec[idx] += 1.0
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec /= norm
+        if toks:
+            feats: list[str] = list(toks)
+            feats += [f"{a}_{b}" for a, b in zip(toks, toks[1:])]
+            joined = " ".join(toks)
+            feats += [joined[i:i + 3] for i in range(len(joined) - 2)]
+            for f in feats:
+                vec[self._hash(f)] += 1.0
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec /= norm
+        self._cache.put(text, vec)
         return vec
 
 
-def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity of two already-L2-normalised vectors, clamped [0,1]."""
+class SentenceTransformerEmbedder(Embedder):
+    name = "sentence-transformers"
+
+    def __init__(self, model_name: str, cache_size: int = 8192,
+                 device: Optional[str] = None) -> None:
+        self.model_name = model_name
+        self.device = device
+        self._cache = _VectorCache(cache_size)
+        self._model = None
+        self._load_lock = threading.Lock()
+
+    def _get_model(self):
+        if self._model is None:
+            with self._load_lock:
+                if self._model is None:
+                    try:
+                        from sentence_transformers import SentenceTransformer
+                    except ImportError as exc:
+                        raise RuntimeError(
+                            "embeddings backend 'sentence-transformers' is "
+                            "configured but the package is not installed; "
+                            "run: pip install -r requirements-ml.txt "
+                            "(or set TWIN_EMBEDDINGS_BACKEND=hashing to run "
+                            "in degraded lexical mode)"
+                        ) from exc
+                    log.info("loading embedding model %s", self.model_name)
+                    self._model = SentenceTransformer(
+                        self.model_name, device=self.device)
+                    self.dim = int(
+                        self._model.get_sentence_embedding_dimension())
+        return self._model
+
+    def encode(self, text: str) -> np.ndarray:
+        cached = self._cache.get(text)
+        if cached is not None:
+            return cached
+        model = self._get_model()
+        vec = model.encode([text], normalize_embeddings=True,
+                           show_progress_bar=False)[0]
+        vec = np.asarray(vec, dtype=np.float32)
+        self._cache.put(text, vec)
+        return vec
+
+    def warmup(self) -> None:
+        self.encode("warmup")
+
+    def info(self) -> dict:
+        return {"backend": self.name, "model": self.model_name,
+                "dim": self.dim or None, "loaded": self._model is not None}
+
+
+def cosine(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
     if a is None or b is None:
         return 0.0
     if a.shape != b.shape:
         return 0.0
     val = float(np.dot(a, b))
-    # both non-negative feature counts => similarity in [0,1]; clamp for safety
     return max(0.0, min(1.0, val))
 
 
-def distance(a: np.ndarray, b: np.ndarray) -> float:
-    """Semantic distance in [0,1]: 1 - cosine similarity."""
+def distance(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
     return 1.0 - cosine(a, b)
 
 
-# Process-wide default embedder (swap here to go to a real on-prem model).
-default_embedder: Embedder = HashingEmbedder()
+def build_embedder(settings: Settings) -> Embedder:
+    if settings.embeddings_backend == "sentence-transformers":
+        return SentenceTransformerEmbedder(
+            settings.embeddings_model,
+            cache_size=settings.embeddings_cache_size,
+            device=settings.embeddings_device,
+        )
+    log.warning(
+        "embeddings backend is 'hashing' — semantic drift detection is "
+        "running in degraded lexical mode; use sentence-transformers in "
+        "production")
+    return HashingEmbedder(cache_size=settings.embeddings_cache_size)

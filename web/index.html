@@ -17,7 +17,7 @@
     color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
   a{color:var(--accent)}
   header{display:flex;align-items:center;gap:18px;padding:16px 24px;border-bottom:1px solid var(--line);
-    position:sticky;top:0;background:rgba(11,15,23,.85);backdrop-filter:blur(8px);z-index:10}
+    position:sticky;top:0;background:rgba(11,15,23,.85);backdrop-filter:blur(8px);z-index:10;flex-wrap:wrap}
   header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
   header .sub{color:var(--dim);font-size:12px;margin-top:2px}
   .grow{flex:1}
@@ -26,9 +26,10 @@
     border-radius:10px;background:var(--panel);min-width:96px}
   .chip .k{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim2)}
   .chip .v{font-size:16px;font-weight:650;font-variant-numeric:tabular-nums}
-  button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);
+  button,select,input{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);
     border-radius:8px;padding:7px 13px;cursor:pointer;transition:.15s}
-  button:hover{border-color:var(--accent);background:#18213a}
+  input{cursor:text;min-width:280px}
+  button:hover,select:hover{border-color:var(--accent);background:#18213a}
   button.primary{background:linear-gradient(180deg,#3556c9,#2a44a8);border-color:#3d5bd0}
   button.primary:hover{filter:brightness(1.1)}
   button.approve{border-color:#1f7a4d} button.approve:hover{background:#123723}
@@ -59,6 +60,7 @@
   .action .why{color:var(--dim);font-size:12.5px;margin:6px 0 9px}
   .pill{font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;padding:3px 8px;border-radius:999px;border:1px solid var(--line)}
   .pill.proposed{color:var(--watch);border-color:#3d3320}
+  .pill.approved{color:var(--contained);border-color:#1c2f52}
   .pill.applied{color:var(--ok);border-color:#173a27}
   .pill.rejected{color:var(--flag);border-color:#3a1a1e}
   .pill.reverted{color:var(--dim)}
@@ -79,24 +81,39 @@
   .node-hit{cursor:pointer}
   .flash{animation:flash 1.4s ease}
   @keyframes flash{0%{background:#1c2a4a}100%{background:var(--panel2)}}
+  #login{position:fixed;inset:0;background:rgba(6,9,15,.92);display:none;align-items:center;justify-content:center;z-index:50}
+  #login .box{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:26px;max-width:420px;box-shadow:var(--shadow)}
+  #login h3{margin:0 0 8px}
+  .err{color:var(--flag);font-size:12.5px;margin-top:8px;min-height:16px}
+  .trace-row{cursor:pointer}
+  .trace-row:hover td{background:#151d30}
 </style>
 </head>
 <body>
+<div id="login"><div class="box">
+  <h3>Authenticate</h3>
+  <div class="hint" style="margin-bottom:12px">Enter an API key with at least the <b>viewer</b> role. Keys are created by an admin via <span class="mono">/api/admin/keys</span> or <span class="mono">scripts/manage_keys.py</span>.</div>
+  <input id="keyinput" type="password" placeholder="twin_..." style="width:100%" onkeydown="if(event.key==='Enter')saveKey()" />
+  <div class="err" id="loginerr"></div>
+  <button class="primary" style="margin-top:10px" onclick="saveKey()">Connect</button>
+</div></div>
+
 <header>
   <div>
     <h1>Agent Drift Containment &amp; Remediation Twin</h1>
-    <div class="sub">Persistent causal digital twin · detect → attribute → remediate → redeploy</div>
+    <div class="sub">Causal digital twin · detect → attribute → remediate → redeploy</div>
   </div>
   <div class="grow"></div>
   <div class="chips" id="chips"></div>
-  <button class="primary" onclick="reseed()">↻ Replay incident</button>
+  <select id="traceSelect" onchange="pickTrace(this.value)" title="Focused trace"></select>
+  <button onclick="refresh()">↻ Refresh</button>
+  <button onclick="logout()" title="Forget the stored API key">Key…</button>
 </header>
 
 <main>
-  <!-- GRAPH -->
   <section class="card" style="grid-row:span 2">
-    <h2>Digital Twin — Incident View <span class="muted" id="twinmeta"></span></h2>
-    <div id="graph"></div>
+    <h2>Digital Twin — Trace View <span class="muted" id="twinmeta"></span></h2>
+    <div id="graph"><div class="body hint">Select a trace to render its influence graph.</div></div>
     <div class="legend">
       <span><i class="dot" style="background:var(--ok)"></i>ok</span>
       <span><i class="dot" style="background:var(--watch)"></i>watch</span>
@@ -108,19 +125,16 @@
     </div>
   </section>
 
-  <!-- NARRATIVE -->
   <section class="card">
-    <h2>Causal Narrative <span class="muted">(the moat: story, not an alert)</span></h2>
+    <h2>Causal Narrative</h2>
     <div class="body"><div class="narr" id="narrative">Loading…</div></div>
   </section>
 
-  <!-- REMEDIATION -->
   <section class="card">
     <h2>Remediation — human-approved &amp; reversible</h2>
     <div class="body" id="remediation"></div>
   </section>
 
-  <!-- TABS -->
   <section class="card full">
     <div class="tabs" id="tabs"></div>
     <div class="body" id="tabbody"></div>
@@ -129,57 +143,97 @@
 
 <script>
 const API = '';
-let STATE = {graph:null, narrative:null, actions:[], cost:null, audit:null, compliance:null,
-            selected:null, tab:'inspector', whatif:{}};
+let STATE = {trace:null, traces:[], incidents:[], graph:null, narrative:null,
+             actions:[], cost:null, audit:null, compliance:null, info:null,
+             guard:null, selected:null, tab:'incidents', whatif:{}};
 
 const $ = s => document.querySelector(s);
-async function jget(u){const r=await fetch(API+u);if(!r.ok)throw new Error(u+' '+r.status);return r.json();}
-async function jpost(u){const r=await fetch(API+u,{method:'POST'});if(!r.ok)throw new Error(u+' '+r.status);return r.json();}
+function apiKey(){ return localStorage.getItem('twin_api_key') || ''; }
+function headers(extra){ return Object.assign({'X-API-Key': apiKey()}, extra||{}); }
+
+async function jfetch(u, opts){
+  const r = await fetch(API+u, Object.assign({headers: headers(opts&&opts.body?{'Content-Type':'application/json'}:{})}, opts));
+  if(r.status===401){ showLogin('The server rejected this key.'); throw new Error('unauthorized'); }
+  if(r.status===403){ throw new Error('this key lacks permission for '+u); }
+  if(!r.ok){ let m=u+' → '+r.status; try{ m=(await r.json()).error.message; }catch(e){} throw new Error(m); }
+  return r.json();
+}
+const jget = u => jfetch(u);
+const jpost = (u, body) => jfetch(u, {method:'POST', body: body?JSON.stringify(body):undefined});
+
+function showLogin(msg){ $('#login').style.display='flex'; $('#loginerr').textContent=msg||''; $('#keyinput').focus(); }
+function saveKey(){
+  const k=$('#keyinput').value.trim();
+  if(!k){ $('#loginerr').textContent='Key required.'; return; }
+  localStorage.setItem('twin_api_key', k);
+  $('#login').style.display='none';
+  refresh();
+}
+function logout(){ localStorage.removeItem('twin_api_key'); showLogin(); }
 
 const STATUS_COLOR={ok:'var(--ok)',watch:'var(--watch)',flagged:'var(--flag)',contained:'var(--contained)'};
-function fmtPct(x){return (x==null?'—':x.toFixed(2)+'%');}
+function fmtPct(x){return (x==null?'n/a':Number(x).toFixed(2)+'%');}
 
-async function loadAll(){
-  const [graph,cost,audit,compliance,rem,persistence,guard] = await Promise.all([
-    jget('/api/graph'), jget('/api/cost'), jget('/api/audit'),
-    jget('/api/compliance'), jget('/api/remediation'),
-    jget('/api/persistence'), jget('/api/guard')]);
-  STATE.graph=graph; STATE.cost=cost; STATE.audit=audit;
-  STATE.compliance=compliance; STATE.actions=rem.actions;
-  STATE.persistence=persistence; STATE.guard=guard;
-  try{ STATE.narrative = await jget('/api/narrative'); }catch(e){ STATE.narrative=null; }
-  renderAll();
+async function refresh(){
+  try{
+    const [traces, incidents, cost, audit, compliance, rem, info, guard] = await Promise.all([
+      jget('/api/traces?limit=100'), jget('/api/incidents?limit=50'),
+      jget('/api/cost'), jget('/api/audit?limit=200'),
+      jget('/api/compliance'), jget('/api/remediation?limit=100'),
+      jget('/api/info'), jget('/api/guard?limit=50')]);
+    STATE.traces=traces.traces; STATE.incidents=incidents.incidents;
+    STATE.cost=cost; STATE.audit=audit; STATE.compliance=compliance;
+    STATE.actions=rem.actions; STATE.info=info; STATE.guard=guard;
+    if(!STATE.trace && STATE.incidents.length) STATE.trace=STATE.incidents[0].trace_id;
+    if(!STATE.trace && STATE.traces.length) STATE.trace=STATE.traces[0].trace_id;
+    if(STATE.trace){ STATE.graph = await jget('/api/graph?trace='+encodeURIComponent(STATE.trace)); }
+    try{ STATE.narrative = await jget('/api/narrative'); }catch(e){ STATE.narrative=null; }
+    renderAll();
+  }catch(e){
+    if(e.message!=='unauthorized') showError(e);
+  }
+}
+function showError(e){
+  $('#narrative').innerHTML='<span class="status-flagged">'+esc(e.message)+'</span>';
 }
 
-async function reseed(){ await jpost('/api/seed'); STATE.whatif={}; STATE.selected=null; await loadAll(); }
+async function pickTrace(t){ STATE.trace=t; STATE.selected=null;
+  STATE.graph = await jget('/api/graph?trace='+encodeURIComponent(t)); renderAll(); }
 
-function renderAll(){ renderChips(); renderGraph(); renderNarrative(); renderRemediation(); renderTabs(); }
+function renderAll(){ renderTraceSelect(); renderChips(); renderGraph(); renderNarrative(); renderRemediation(); renderTabs(); }
 
-/* ---------- chips ---------- */
+function renderTraceSelect(){
+  const sel=$('#traceSelect');
+  const flaggedSet=new Set(STATE.incidents.map(i=>i.trace_id));
+  sel.innerHTML = STATE.traces.map(t=>
+    `<option value="${esc(t.trace_id)}" ${t.trace_id===STATE.trace?'selected':''}>` +
+    `${flaggedSet.has(t.trace_id)?'⚠ ':''}${esc(t.trace_id)} (${t.span_count})</option>`).join('')
+    || '<option>no traces yet</option>';
+}
+
 function renderChips(){
-  const c=STATE.cost, comp=STATE.compliance, p=STATE.persistence||{}, g=STATE.guard||{};
-  const flagged=(STATE.graph.nodes||[]).filter(n=>n.drift.status==='flagged').length;
+  const c=STATE.cost, comp=STATE.compliance, g=STATE.guard||{}, i=STATE.info||{};
+  const flagged=STATE.incidents.reduce((a,x)=>a+(x.flagged_count||0),0);
+  const judgeMode=(i.judge&&i.judge.enabled)?'LLM':'degraded';
+  const embMode=(i.embeddings&&i.embeddings.backend)||'?';
   $('#chips').innerHTML = [
-    chip('Twin persistence', p.durable?('✓ durable · '+p.nodes_in_twin):'in-memory',
-         p.durable?'var(--ok)':'var(--watch)',
-         'Backed by a file DB. boot_mode='+(p.boot_mode||'?')+
-         ' — the graph, audit chain & cost snapshot survive a process restart.'),
-    chip('Compute overhead*', '~'+fmtPct(c.overhead_pct), c.overhead_pct<5?'var(--ok)':'var(--watch)',
-         'MODELLED from fixed per-tier token constants, not measured against a live model.'),
+    chip('Nodes in twin', i.nodes_in_twin!=null?i.nodes_in_twin:'—','var(--ink)'),
+    chip('Incidents', STATE.incidents.length, STATE.incidents.length?'var(--flag)':'var(--ok)'),
+    chip('Flagged spans', flagged, flagged?'var(--flag)':'var(--ok)'),
     chip('Blocked pre-exec', g.blocked_count||0, (g.blocked_count?'var(--flag)':'var(--ink)'),
-         'Dangerous actions stopped synchronously by the inline deterministic rail before execution.'),
-    chip('Flagged (incident)', flagged, flagged?'var(--flag)':'var(--ok)'),
+         'Dangerous actions denied synchronously by the inline rail'),
     chip('Audit chain', comp.chain_valid?'✓ valid':'✗ broken', comp.chain_valid?'var(--ok)':'var(--flag)'),
+    chip('Judge', judgeMode, judgeMode==='LLM'?'var(--ok)':'var(--watch)',
+         judgeMode==='LLM'?'LLM judge active at escalation tiers':'No LLM key configured — deterministic fallback'),
+    chip('Embeddings', embMode.indexOf('hash')===0?'degraded':'semantic',
+         embMode.indexOf('hash')===0?'var(--watch)':'var(--ok)', embMode),
   ].join('');
 }
 function chip(k,v,color,title){return `<div class="chip"${title?` title="${esc(title)}"`:''}><span class="k">${k}</span><span class="v" style="color:${color}">${v}</span></div>`;}
 
-/* ---------- graph (custom layered SVG DAG) ---------- */
 function layout(nodes,edges){
-  const byId={}; nodes.forEach(n=>byId[n.node_id]=n);
   const preds={}, succ={}; nodes.forEach(n=>{preds[n.node_id]=[];succ[n.node_id]=[];});
   edges.forEach(e=>{ if(succ[e.src]){succ[e.src].push(e.dst); preds[e.dst].push(e.src);} });
-  // longest-path layering
   const level={}; const order=topo(nodes,edges);
   order.forEach(id=>{ level[id]=0; preds[id].forEach(p=>{ level[id]=Math.max(level[id],(level[p]||0)+1);});});
   const byLevel={}; nodes.forEach(n=>{(byLevel[level[n.node_id]] ||= []).push(n.node_id);});
@@ -194,9 +248,14 @@ function topo(nodes,edges){
   return out;
 }
 function renderGraph(){
-  const {nodes,edges,total_nodes_in_twin}=STATE.graph;
-  $('#twinmeta').textContent = `· ${nodes.length} of ${total_nodes_in_twin} runs in twin`;
-  const {level,byLevel}=layout(nodes,edges);
+  if(!STATE.graph||!STATE.graph.nodes.length){
+    $('#graph').innerHTML='<div class="body hint">No spans in this trace yet.</div>';
+    $('#twinmeta').textContent='';
+    return;
+  }
+  const {nodes,edges,node_count}=STATE.graph;
+  $('#twinmeta').textContent = `· ${nodes.length} span(s)` + (node_count>nodes.length?` of ${node_count}`:'');
+  const {byLevel}=layout(nodes,edges);
   const COLW=180, ROWH=92, PADX=40, PADY=36, NW=140, NH=58;
   const maxLevel=Math.max(...Object.keys(byLevel).map(Number),0);
   const maxRows=Math.max(...Object.values(byLevel).map(a=>a.length),1);
@@ -220,7 +279,6 @@ function renderGraph(){
       <path d="M0,0 L8,3 L0,6 Z" fill="#48577a"/></marker>
     <marker id="arrowhot" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
       <path d="M0,0 L8,3 L0,6 Z" fill="#ef4d5a"/></marker></defs>`;
-  // edges
   edges.forEach(e=>{
     const a=pos[e.src],b=pos[e.dst]; if(!a||!b)return;
     const x1=a.x+NW,y1=a.y+NH/2,x2=b.x,y2=b.y+NH/2;
@@ -232,13 +290,12 @@ function renderGraph(){
       ${filtered?'stroke-dasharray="3 4"':''} marker-end="url(#${hot?'arrowhot':'arrow'})" opacity="${filtered?.5:.95}"/>`;
     if(filtered){ svg+=`<text x="${mx}" y="${(y1+y2)/2-6}" fill="#2f3a52" font-size="10" text-anchor="middle">filtered</text>`;}
   });
-  // nodes
   nodes.forEach(n=>{
     const p=pos[n.node_id]; const st=n.drift.status; const col=STATUS_COLOR[st]||'var(--dim)';
     const isRoot=n.node_id===rootId; const inBlast=blastSet.has(n.node_id);
     const sel=STATE.selected===n.node_id;
     const stroke=isRoot?'#a78bfa':(sel?'#7c9cff':col);
-    svg+=`<g class="node-hit" onclick="selectNode('${n.node_id}')" transform="translate(${p.x},${p.y})">`;
+    svg+=`<g class="node-hit" onclick="selectNode('${esc(n.node_id)}')" transform="translate(${p.x},${p.y})">`;
     svg+=`<rect width="${NW}" height="${NH}" rx="11" fill="#111a2b" stroke="${stroke}"
       stroke-width="${isRoot||sel?2.6:1.4}" ${n.quarantined?'stroke-dasharray="5 4"':''}/>`;
     svg+=`<rect width="5" height="${NH}" rx="2" fill="${col}"/>`;
@@ -255,10 +312,9 @@ function renderGraph(){
   $('#graph').innerHTML=svg;
 }
 
-/* ---------- narrative ---------- */
 function renderNarrative(){
   const n=STATE.narrative;
-  if(!n){ $('#narrative').textContent='No active incident. Traffic is clean.'; return; }
+  if(!n){ $('#narrative').textContent='No drifted spans to attribute. Traffic is clean.'; return; }
   const html = esc(n.narrative)
     .replace('Root cause:','<b>Root cause:</b>')
     .replace('Propagation path:','<b>Propagation path:</b>')
@@ -267,7 +323,6 @@ function renderNarrative(){
   $('#narrative').innerHTML = html;
 }
 
-/* ---------- remediation ---------- */
 function renderRemediation(){
   const acts=STATE.actions;
   if(!acts.length){ $('#remediation').innerHTML='<div class="hint">No proposed remediation.</div>'; return; }
@@ -286,7 +341,7 @@ function renderRemediation(){
         ${canAct?`<button class="approve" onclick="approve('${a.action_id}')">Approve &amp; apply</button>
                   <button class="reject" onclick="reject('${a.action_id}')">Reject</button>`:''}
         ${canRevert?`<button onclick="revert('${a.action_id}')">Revert</button>`:''}
-        <button onclick="previewWhatif('${a.action_id}','${a.node_id}')">What-if preview</button>
+        <button onclick="previewWhatif('${a.action_id}','${esc(a.node_id)}')">What-if preview</button>
       </div>
       ${wi?renderWhatif(wi):''}
     </div>`;
@@ -297,7 +352,7 @@ function renderWhatif(wi){
   const saved=wi.contained_nodes.length;
   const still=wi.remediated_blast_radius.length;
   return `<div class="whatif">
-    <div class="hint" style="margin-bottom:7px">Counterfactual preview (advisory — a <b>real forward replay</b> over the twin: corrected context substituted at the root, detection re-run node-by-node; no agents re-executed, no new inference):</div>
+    <div class="hint" style="margin-bottom:7px">Counterfactual preview — corrected context substituted at the root and detection re-run node-by-node over the twin (no agents re-executed):</div>
     <div class="cols2">
       <div class="minibox"><div class="t">Do nothing</div><div class="n" style="color:var(--flag)">${before}</div><div class="hint">nodes stay drifted</div></div>
       <div class="minibox"><div class="t">After this fix</div><div class="n" style="color:var(--ok)">${saved} saved</div><div class="hint">${still} keep own fault</div></div>
@@ -306,26 +361,41 @@ function renderWhatif(wi){
   </div>`;
 }
 
-async function approve(id){ await jpost('/api/remediation/'+id+'/approve'); await loadAll(); flashGraph(); }
-async function reject(id){ await jpost('/api/remediation/'+id+'/reject'); await loadAll(); }
-async function revert(id){ await jpost('/api/remediation/'+id+'/revert'); await loadAll(); }
-async function previewWhatif(aid,nid){ STATE.whatif[aid]=await jget('/api/whatif/'+nid); renderRemediation(); }
+async function approve(id){ try{ await jpost('/api/remediation/'+id+'/approve'); }catch(e){ alertErr(e); } await refresh(); flashGraph(); }
+async function reject(id){ try{ await jpost('/api/remediation/'+id+'/reject'); }catch(e){ alertErr(e); } await refresh(); }
+async function revert(id){ try{ await jpost('/api/remediation/'+id+'/revert'); }catch(e){ alertErr(e); } await refresh(); }
+function alertErr(e){ showError(e); }
+async function previewWhatif(aid,nid){ STATE.whatif[aid]=await jget('/api/whatif/'+encodeURIComponent(nid)); renderRemediation(); }
 function flashGraph(){ const g=$('#graph'); g.classList.remove('flash'); void g.offsetWidth; g.classList.add('flash'); }
 
-/* ---------- node select ---------- */
-async function selectNode(id){ STATE.selected=id; STATE.tab='inspector'; STATE.nodeDetail=await jget('/api/node/'+id); renderGraph(); renderTabs(); }
+async function selectNode(id){ STATE.selected=id; STATE.tab='inspector'; STATE.nodeDetail=await jget('/api/node/'+encodeURIComponent(id)); renderGraph(); renderTabs(); }
 
-/* ---------- tabs ---------- */
-const TABS=[['inspector','Node Inspector'],['cost','Cost Router'],['audit','Audit Trail'],['compliance','Compliance']];
+const TABS=[['incidents','Incidents'],['inspector','Node Inspector'],['cost','Cost Router'],['audit','Audit Trail'],['compliance','Compliance']];
 function renderTabs(){
   $('#tabs').innerHTML=TABS.map(([k,l])=>`<div class="tab ${STATE.tab===k?'active':''}" onclick="setTab('${k}')">${l}</div>`).join('');
   const body=$('#tabbody');
-  if(STATE.tab==='inspector') body.innerHTML=renderInspector();
+  if(STATE.tab==='incidents') body.innerHTML=renderIncidents();
+  else if(STATE.tab==='inspector') body.innerHTML=renderInspector();
   else if(STATE.tab==='cost') body.innerHTML=renderCost();
   else if(STATE.tab==='audit') body.innerHTML=renderAudit();
   else if(STATE.tab==='compliance') body.innerHTML=renderCompliance();
 }
 function setTab(k){STATE.tab=k;renderTabs();}
+
+function renderIncidents(){
+  if(!STATE.incidents.length) return '<div class="hint">No traces with flagged spans.</div>';
+  const rows=STATE.incidents.map(t=>`<tr class="trace-row" onclick="pickTrace('${esc(t.trace_id)}')">
+    <td class="mono">${esc(t.trace_id)}</td>
+    <td>${t.span_count}</td>
+    <td class="status-flagged">${t.flagged_count}</td>
+    <td>${t.blocked_count||0}</td>
+    <td class="mono">${(t.max_score||0).toFixed(2)}</td>
+    <td class="mono">${esc(t.root_cause_node||'—')}</td>
+    <td>${esc(t.risk_type||'—')}</td>
+  </tr>`).join('');
+  return `<div class="hint" style="margin-bottom:8px">Traces containing flagged spans. Click a row to focus its graph.</div>
+  <table><thead><tr><th>Trace</th><th>Spans</th><th>Flagged</th><th>Blocked</th><th>Max score</th><th>Root cause</th><th>Risk</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
 
 function renderInspector(){
   const n=STATE.nodeDetail;
@@ -340,19 +410,17 @@ function renderInspector(){
         <span class="k">Agent</span><span><b>${esc(n.agent_id)}</b> — ${esc(n.agent_role)}</span>
         <span class="k">Privilege</span><span>${n.privilege}${n.privilege==='high'?' ⚠':''}</span>
         <span class="k">Status</span><span class="status-${d.status}"><b>${d.status}</b> · score ${d.score.toFixed(2)}</span>
-        <span class="k">Risk type</span><span>${d.risk_type?esc(d.risk_type):'<span class=muted>—</span>'}</span>
+        <span class="k">Risk type</span><span>${d.risk_type?esc(d.risk_type):'<span class=muted>—</span>'}${d.owasp_ref?` <span class="tag">${esc(d.owasp_ref)}</span>`:''}</span>
         <span class="k">Tier reached</span><span class="mono">${d.tier_reached}</span>
         <span class="k">Inline rail</span><span>${n.blocked?'<b class=status-flagged>✕ action blocked pre-exec</b>':'—'}</span>
         <span class="k">Quarantined</span><span>${n.quarantined?'<b class=status-contained>yes</b>':'no'}</span>
       </div>
       ${bar('Stated-vs-revealed gap — structural (PRIMARY)',d.stated_vs_revealed,'var(--flag)')}
-      ${bar('Trajectory drift — lexical (illustrative)',d.trajectory_drift,'var(--watch)')}
+      ${bar('Trajectory drift — semantic',d.trajectory_drift,'var(--watch)')}
       <div class="hint" style="margin-top:7px">
-        Primary trigger: <b style="color:${d.svr_primary&&d.svr_primary!=='lexical'?'var(--flag)':'var(--dim)'}">${esc(d.svr_primary||'—')}</b>
-        ${d.svr_primary&&d.svr_primary!=='lexical'?'<span class="muted">(structural, keyword-free)</span>':'<span class="muted">(no structural divergence)</span>'}
+        Primary trigger: <b style="color:${d.svr_primary&&d.svr_primary!=='semantic'?'var(--flag)':'var(--dim)'}">${esc(d.svr_primary||'—')}</b>
         ${d.injection_introduced?'<br>⚠ <b style="color:var(--flag)">origin</b> of a task-foreign entity — structural injection, not a planted phrase':''}
         ${(d.foreign_entities&&d.foreign_entities.length)?('<br>Foreign entities: <span class="mono">'+d.foreign_entities.map(esc).join(', ')+'</span>'):''}
-        <br><span class="muted">Embedding distances come from the offline lexical stub — illustrative, never the sole trigger.</span>
       </div>
     </div>
     <div>
@@ -366,7 +434,7 @@ function renderInspector(){
   </div>
   <div style="margin-top:12px">
     <div class="k muted" style="margin-bottom:4px">Deterministic checks (zero-token)</div>${flags}
-    <div class="k muted" style="margin:10px 0 4px">Small-model judge (escalation only)</div>${judge}
+    <div class="k muted" style="margin:10px 0 4px">Judge (escalation only)</div>${judge}
   </div>`;
 }
 function bar(label,v,col){
@@ -377,16 +445,16 @@ function bar(label,v,col){
 function renderCost(){
   const c=STATE.cost; const t=c.tier_counts;
   return `<div class="cols2" style="margin-bottom:14px">
-    <div class="minibox"><div class="t">Compute overhead <span style="color:var(--dim2)">(modelled*)</span></div><div class="n" style="color:${c.overhead_pct<5?'var(--ok)':'var(--watch)'}">~${fmtPct(c.overhead_pct)}</div><div class="hint">added ÷ baseline — *token figures modelled from fixed per-tier constants, not measured against a live model</div></div>
+    <div class="minibox"><div class="t">Monitoring overhead (measured)</div><div class="n" style="color:${c.overhead_pct==null?'var(--dim)':(c.overhead_pct<5?'var(--ok)':'var(--watch)')}">${fmtPct(c.overhead_pct)}</div><div class="hint">judge tokens ÷ baseline tokens reported by telemetry; n/a until agents report usage</div></div>
     <div class="minibox"><div class="t">Dedup cache hits</div><div class="n">${c.cache_hits}</div><div class="hint">repeated reasoning never re-analysed</div></div>
   </div>
   <table><thead><tr><th>Tier</th><th>Spans routed</th><th>Note</th></tr></thead><tbody>
     <tr><td class="mono">zero_inference</td><td>${t.zero_inference}</td><td class="muted">CPU-only: embeddings, diffing, validators</td></tr>
-    <tr><td class="mono">sampled</td><td>${t.sampled}</td><td class="muted">risk-weighted thinning of low-stakes agents</td></tr>
-    <tr><td class="mono">small_judge</td><td>${t.small_judge}</td><td class="muted">narrow classifier, only after a cheap flag</td></tr>
-    <tr><td class="mono">deep_escalation</td><td>${t.deep_escalation}</td><td class="muted">full-context deep analysis — only on flagged</td></tr>
+    <tr><td class="mono">sampled</td><td>${t.sampled}</td><td class="muted">risk-weighted thinning of low-privilege agents</td></tr>
+    <tr><td class="mono">small_judge</td><td>${t.small_judge}</td><td class="muted">judge invoked only after a cheap-signal flag</td></tr>
+    <tr><td class="mono">deep_escalation</td><td>${t.deep_escalation}</td><td class="muted">deep-model confirmation — only on FLAGGED</td></tr>
   </tbody></table>
-  <div class="hint" style="margin-top:10px">${c.spans_seen} spans observed · ${c.spans_sampled} sampled · baseline ${c.baseline_tokens.toLocaleString()} tok · added ${c.added_tokens.toLocaleString()} tok. The escalation trigger is deterministic and computed by the platform — it is never exposed to the monitored agents, so they cannot suppress it.</div>`;
+  <div class="hint" style="margin-top:10px">${c.spans_seen} spans observed · ${c.spans_sampled} sampled · baseline ${(c.baseline_tokens||0).toLocaleString()} tok reported · ${(c.added_tokens||0).toLocaleString()} judge tok added.</div>`;
 }
 
 function renderAudit(){
@@ -397,20 +465,20 @@ function renderAudit(){
     <td>${esc(e.detail)}</td>
     <td>${(e.compliance_tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('')||'<span class=muted>—</span>'}</td>
   </tr>`).join('');
-  return `<div class="hint" style="margin-bottom:8px">Tamper-evident hash chain: <b class="${STATE.compliance.chain_valid?'status-ok':'status-flagged'}">${STATE.compliance.chain_valid?'✓ verified':'✗ broken'}</b> · ${STATE.audit.entries.length} entries. Every supervisor action is attributable, reversible, and logged.</div>
+  return `<div class="hint" style="margin-bottom:8px">Tamper-evident hash chain: <b class="${STATE.compliance.chain_valid?'status-ok':'status-flagged'}">${STATE.compliance.chain_valid?'✓ verified':'✗ broken'}</b> · showing latest ${STATE.audit.entries.length} of ${STATE.audit.total} entries. Every operator action is attributable and logged.</div>
   <table><thead><tr><th>Action</th><th>Actor</th><th>Target</th><th>Detail</th><th>Compliance mapping</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function renderCompliance(){
   const c=STATE.compliance;
   const rows=Object.entries(c.coverage_by_clause).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="mono">${v}</td></tr>`).join('');
-  return `<div class="hint" style="margin-bottom:8px">Same audit data, re-projected for GRC. Framework list is configurable (swappable annotation, not baked in). Report generated on demand.</div>
+  return `<div class="hint" style="margin-bottom:8px">Audit data re-projected per compliance clause. The framework map is configuration, not code.</div>
   <table><thead><tr><th>Framework clause</th><th>Events logged</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
-function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 
-loadAll().catch(e=>{document.body.innerHTML='<pre style="padding:24px;color:#ef4d5a">'+e.stack+'</pre>';});
+if(!apiKey()) showLogin(); else refresh();
 </script>
 </body>
 </html>

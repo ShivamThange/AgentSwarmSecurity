@@ -1,21 +1,27 @@
-# Live integration stack (Phases 0-4) — reused components per builder brief §9.
-# Heavy (LlamaFirewall pulls torch/transformers). Install into the same environment
-# as requirements.txt. NOT needed for the offline demo or the test suite.
-#
-#   pip install -r requirements.txt -r requirements-integrations.txt
-#
-# TrinityGuard is installed from source (not on PyPI):
-#   git clone https://github.com/AI45Lab/TrinityGuard && pip install -e ./TrinityGuard
+# Optional external integrations wired behind the twin's internal seams.
+# NONE of these are required to run: every adapter degrades to the native
+# deterministic component when its package is absent (verify with
+# `python scripts/validate_boundary.py`). Install only the ones you enable.
 
-# --- Substrate (Phase 1): telemetry store + OTel + eval API ---
-arize-phoenix>=7.0            # self-hosted trace store; our Span <-> OTel span boundary
-openinference-instrumentation # OTel semantic conventions for LLM/agent spans
+# --- Judge backend: TWIN_JUDGE_BACKEND=llamafirewall ---
+# Meta LlamaFirewall — AlignmentCheck + PromptGuard scanners behind
+# detection.Judge. AlignmentCheck may require a local or hosted model; see the
+# LlamaFirewall docs for on-prem model configuration.
+llamafirewall>=1.0
 
-# --- Orchestration adapter (Phase 2): TrinityGuard's BaseMAS targets AG2/AutoGen ---
-ag2>=0.7                      # AutoGen (AG2) — TrinityGuard's reference MAS framework
+# --- Inline rail backend: TWIN_GUARD_BACKEND=nemo (+ TWIN_NEMO_CONFIG_PATH) ---
+# NVIDIA NeMo Guardrails — Colang rails layered over the native rail.
+nemoguardrails>=0.11
 
-# --- Drift/alignment scanner (Phase 3) ---
-llamafirewall>=1.0           # AlignmentCheck scanner (stated-vs-revealed) + PromptGuard
+# --- Telemetry substrate: point Phoenix / Langfuse OTLP exporters at
+#     /v1/traces. The twin already parses their span conventions natively;
+#     these are only needed to run the tools themselves. ---
+arize-phoenix>=7.0
+openinference-semantic-conventions>=0.1
+langfuse>=2.0
 
-# --- Deterministic gates (Phase 4) ---
-nemoguardrails>=0.11         # rails engine for the inline hard-stop rail
+# --- Agent-framework handoff tap (twin.integrations.handoff) ---
+# The converters accept plain dict/message shapes, so these are needed only in
+# the agent process that emits spans, not by the twin service.
+ag2>=0.7
+langgraph>=0.2

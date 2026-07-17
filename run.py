@@ -1,5 +1,8 @@
-"""Convenience launcher. `python run.py` then open http://127.0.0.1:8000"""
 import uvicorn
 
+from twin.config import get_settings
+
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
+    settings = get_settings()
+    uvicorn.run("app:app", host=settings.host, port=settings.port,
+                reload=False)
